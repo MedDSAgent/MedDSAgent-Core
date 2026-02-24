@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "medds_agent"
+version = "0.1.0"
+description = "Medical Data Science Agent — backend API and core agent library"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    # LLM inference
+    "llm_inference_engine>=0.1.3",
+    "openai>=1.3.0",
+    # Data science core
+    "pandas>=2.1.0",
+    "numpy>=1.24.0",
+    "matplotlib>=3.8.0",
+    "sqlalchemy>=2.0.0",
+    # Serialization / utilities
+    "dill>=0.3.7",
+    "pydantic>=2.5.0",
+    "rich>=13.7.0",
+    "json-repair>=0.55.0",
+]
+
+[project.optional-dependencies]
+# FastAPI server (medds-server entry point)
+server = [
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "aiofiles>=23.2.0",
+    "httpx>=0.25.0",
+    "python-multipart>=0.0.9",
+]
+# Document parsing via Docling
+docling = [
+    "docling>=2.70.0",
+]
+# R execution via rpy2
+r = [
+    "rpy2>=3.5.0",
+]
+# Optional database drivers
+databases = [
+    "pymysql",
+    "psycopg2-binary",
+    "oracledb",
+]
+# Development / testing
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "black",
+    "ruff",
+]
+
+[project.scripts]
+medds-agent = "medds_agent.cli:main"
+medds-server = "medds_agent.server:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["medds_agent*"]
+
+[tool.setuptools.package-data]
+"medds_agent.asset" = ["*.sql"]
+"medds_agent.asset.prompt_templates" = ["*.md"]
+"medds_agent.asset.prompt_templates.specialty" = ["*.md", "*.json"]

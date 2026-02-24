@@ -1,0 +1,7 @@
+medds_agent.egg-info/
+.vscode/
+__pycache__/
+*.pyc
+*.pyo
+workspace/
+.env

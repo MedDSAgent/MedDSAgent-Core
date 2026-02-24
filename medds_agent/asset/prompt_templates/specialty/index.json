@@ -1,0 +1,12 @@
+[
+    {
+        "id": "biostatistics_medical_outcomes_research",
+        "display_name": "Biostatistics: Medical Outcomes Research",
+        "filename": "Biostatistics_Medical_Outcomes_Research.md"
+    },
+    {
+        "id": "data_wrangling_electronic_medical_records",
+        "display_name": "Data Wrangling: Electronic Medical Records",
+        "filename": "Data_Wrangling_Electronic_Medical_Records.md"
+    }
+]
