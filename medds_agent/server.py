@@ -507,7 +507,7 @@ async def list_files(session_id: str, path: str = Query(default="")):
         
         files = []
         for entry in sorted(os.listdir(target_path)):
-            if entry.startswith('.') or entry in ["state.pkl", "state.RData", "session_config.json"]:
+            if entry.startswith('.') or entry in ["state.pkl", "state.RData", "internal"]:
                 continue
                 
             full_path = os.path.join(target_path, entry)
