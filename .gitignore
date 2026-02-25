@@ -1,5 +1,6 @@
 medds_agent.egg-info/
 .vscode/
+.claude/
 __pycache__/
 *.pyc
 *.pyo
