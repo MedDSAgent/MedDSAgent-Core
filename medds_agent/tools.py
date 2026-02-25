@@ -46,6 +46,16 @@ class Tool(abc.ABC):
         """Return OpenAI-compatible tool schema."""
         raise NotImplementedError
 
+    def get_title(self, args: Dict) -> str:
+        """
+        Return a one-line display title for this tool call.
+
+        The default implementation reads the LLM-provided 'title' key from args
+        (used by code executor tools). Tools whose title can be derived from
+        structured parameters should override this method instead.
+        """
+        return args.get("title", "")
+
 class PythonExecutorTool(Tool):
     """
     Full Python executor for local or Docker-isolated environments.
@@ -374,12 +384,21 @@ os.chdir(WORK_DIR)
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "title": {
+                            "type": "string",
+                            "description": (
+                                "A one-line summary of what this code does, shown in the UI when the code block is collapsed. "
+                                "Be specific and concise (e.g., 'Load data from uploads/data.csv and inspect shape', "
+                                "'Fit logistic regression for mortality with predictors age, sex, and BMI', "
+                                "'Plot Kaplan-Meier survival curve by treatment group')."
+                            ),
+                        },
                         "code": {
                             "type": "string",
                             "description": "Python code to execute.",
                         },
                     },
-                    "required": ["code"],
+                    "required": ["title", "code"],
                 },
             },
         }
@@ -726,12 +745,21 @@ class RExecutorTool(Tool):
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "title": {
+                            "type": "string",
+                            "description": (
+                                "A one-line summary of what this code does, shown in the UI when the code block is collapsed. "
+                                "Be specific and concise (e.g., 'Load data from uploads/data.csv and inspect shape', "
+                                "'Fit logistic regression for mortality with predictors age, sex, and BMI', "
+                                "'Plot Kaplan-Meier survival curve by treatment group')."
+                            ),
+                        },
                         "code": {
                             "type": "string",
                             "description": "R code to execute.",
                         },
                     },
-                    "required": ["code"],
+                    "required": ["title", "code"],
                 },
             },
         }
@@ -850,6 +878,23 @@ class DocumentSearchTool(Tool):
             if child['content']:
                 parts.append(child['content'])
             self._collect_children(document_id, child['section_id'], parts, depth + 1)
+
+    def get_title(self, args: Dict) -> str:
+        action = args.get("action", "")
+        file = args.get("file", "")
+        section_id = args.get("section_id", "")
+        if action == "list_documents":
+            return "List documents"
+        elif action == "get_outline":
+            return f"Get outline of {file}" if file else "Get outline"
+        elif action == "read_section":
+            parts = "read section"
+            if section_id:
+                parts += f" {section_id}"
+            if file:
+                parts += f" of {file}"
+            return parts.capitalize()
+        return action
 
     def get_tool_call_schema(self) -> Dict:
         return {
@@ -1041,6 +1086,19 @@ class FileSystemTool(Tool):
                 return f"{size:.1f} {unit}" if unit != 'B' else f"{size} {unit}"
             size /= 1024
         return f"{size:.1f} TB"
+
+    def get_title(self, args: Dict) -> str:
+        action = args.get("action", "")
+        path = args.get("path", "")
+        if action == "list":
+            return f"List {path}" if path else "List workspace"
+        elif action == "read":
+            return f"Read file {path}" if path else "Read file"
+        elif action == "write":
+            return f"Write to {path}" if path else "Write file"
+        elif action == "delete":
+            return f"Delete {path}" if path else "Delete file"
+        return action
 
     def get_tool_call_schema(self) -> Dict:
         return {

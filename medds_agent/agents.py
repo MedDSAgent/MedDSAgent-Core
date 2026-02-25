@@ -94,20 +94,20 @@ class Agent:
 
             # Tool Call
             if step.tool_name and step.tool_name != "end_round":
-                # PythonExecutor special formatting
-                if step.tool_name == "PythonExecutor":
+                panel_title = step.tool_title if step.tool_title else f"Tool Call: {step.tool_name}"
+                # PythonExecutor / RExecutor: syntax-highlight the code
+                if step.tool_name in ("PythonExecutor", "RExecutor"):
                     tool_args = json.loads(step.tool_args)
-                    syntax = Syntax(tool_args['code'], "python", theme="monokai", line_numbers=True)
-
-                    # Create a Group to combine header and syntax
+                    lang = "python" if step.tool_name == "PythonExecutor" else "r"
+                    syntax = Syntax(tool_args['code'], lang, theme="monokai", line_numbers=True)
                     content = Group(
-                        f"[bold]Calling Tool:[/bold] {step.tool_name}\n[bold]Python Code:[/bold]",
+                        f"[bold]Tool:[/bold] {step.tool_name}",
                         syntax
                     )
-                    self.console.print(Panel(content, title="Tool Call", style="cyan"))
+                    self.console.print(Panel(content, title=panel_title, style="cyan"))
                 # General Tool Call
                 else:
-                    self.console.print(Panel(f"Calling Tool: {step.tool_name}\nParameters: {step.tool_args}", title="Tool Call", style="cyan"))
+                    self.console.print(Panel(f"Tool: {step.tool_name}\nParameters: {step.tool_args}", title=panel_title, style="cyan"))
 
         elif isinstance(step, ObservationStep):
             if step.output:
@@ -163,6 +163,9 @@ class Agent:
                     tool_name = tool_call['name'] if tool_call['name'] else ""
                     arguments = json.loads(tool_call['arguments'])
 
+                    # Find the tool (needed for get_title before recording)
+                    tool = next((t for t in self.tools if t.name == tool_name), None)
+
                     # Record AgentStep (no response text)
                     agent_step = AgentStep(
                         agent_id=self.agent_id,
@@ -171,6 +174,7 @@ class Agent:
                         response="",
                         tool_name=tool_name,
                         tool_args=json.dumps(arguments, indent=2),
+                        tool_title=tool.get_title(arguments) if tool else "",
                         is_final=False
                     )
                     if self.verbose:
@@ -178,8 +182,6 @@ class Agent:
                     self.history.add_step(agent_step)
                     self.agent_memory.on_step_added(agent_step)
 
-                    # Find and execute the tool
-                    tool = next((t for t in self.tools if t.name == tool_name), None)
                     if tool is None:
                         tool_output = f"Error: Tool '{tool_name}' not found."
                     else:
@@ -256,6 +258,9 @@ class Agent:
                     tool_name = tool_call['name']
                     arguments = json.loads(tool_call['arguments'])
 
+                    # Find the tool (needed for get_title before recording)
+                    tool = next((t for t in self.tools if t.name == tool_name), None)
+
                     # Record AgentStep
                     agent_step = AgentStep(
                         agent_id=self.agent_id,
@@ -264,6 +269,7 @@ class Agent:
                         response="",
                         tool_name=tool_name,
                         tool_args=json.dumps(arguments, indent=2),
+                        tool_title=tool.get_title(arguments) if tool else "",
                         is_final=False
                     )
                     if self.verbose:
@@ -271,8 +277,6 @@ class Agent:
                     self.history.add_step(agent_step)
                     await self.agent_memory.on_step_added_async(agent_step)
 
-                    # Find and execute the tool
-                    tool = next((t for t in self.tools if t.name == tool_name), None)
                     if tool is None:
                         tool_output = f"Error: Tool '{tool_name}' not found."
                     else:
@@ -668,7 +672,15 @@ class Agent:
                     # 3. Yield Tool Calls (Preview for frontend)
                     tool_calls = llm_response.get('tool_calls', [])
                     if tool_calls:
-                        yield {"type": "tool_calls", "data": tool_calls}
+                        enriched = []
+                        for tc in tool_calls:
+                            try:
+                                args = json.loads(tc.get('arguments', '{}'))
+                            except Exception:
+                                args = {}
+                            tool = next((t for t in self.tools if t.name == tc.get('name')), None)
+                            enriched.append({**tc, 'tool_title': tool.get_title(args) if tool else ''})
+                        yield {"type": "tool_calls", "data": enriched}
 
                     # 4. Process Execution (Executes tools, updates history, yields outputs)
                     is_final_answer = False

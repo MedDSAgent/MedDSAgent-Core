@@ -127,7 +127,7 @@ class UserStep(Step):
     
 
 class AgentStep(Step):
-    def __init__(self, agent_id: str, start_time: datetime, end_time: datetime, response: str=None, tool_name: str=None, tool_args: str=None, is_final: bool=False, step_id: str=None):
+    def __init__(self, agent_id: str, start_time: datetime, end_time: datetime, response: str=None, tool_name: str=None, tool_args: str=None, tool_title: str="", is_final: bool=False, step_id: str=None):
         """
         Assistant action step.
 
@@ -145,6 +145,9 @@ class AgentStep(Step):
             The name of the tool to call.
         tool_args: str, Optional
             The serialized arguments.
+        tool_title: str, Optional
+            A one-line display summary of what the tool call does, used by the
+            frontend to label collapsed code blocks.
         is_final: bool, Optional
             Whether this step is the final answer.
         step_id: str, Optional
@@ -155,11 +158,12 @@ class AgentStep(Step):
         self.response = response
         self.tool_name = tool_name
         self.tool_args = tool_args
+        self.tool_title = tool_title
         self.is_final = is_final
 
     def __repr__(self):
-        return (f"AgentStep(agent_id={self.agent_id}, start_time={self.start_time}, end_time={self.end_time}, response={self.response}, tool_name={self.tool_name}, tool_args={self.tool_args}, is_final={self.is_final})")
-        
+        return (f"AgentStep(agent_id={self.agent_id}, start_time={self.start_time}, end_time={self.end_time}, response={self.response}, tool_name={self.tool_name}, tool_args={self.tool_args}, tool_title={self.tool_title}, is_final={self.is_final})")
+
     def serialize(self) -> Dict[str, Any]:
         return {
             "type": "AgentStep",
@@ -170,6 +174,7 @@ class AgentStep(Step):
             "response": self.response,
             "tool_name": self.tool_name,
             "tool_args": self.tool_args,
+            "tool_title": self.tool_title,
             "is_final": self.is_final
         }
 
@@ -182,6 +187,7 @@ class AgentStep(Step):
             response=data["response"],
             tool_name=data["tool_name"],
             tool_args=data["tool_args"],
+            tool_title=data.get("tool_title", ""),
             is_final=data.get("is_final", False),
             step_id=data.get("step_id")
         )
