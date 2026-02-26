@@ -67,6 +67,41 @@ class PythonExecutorTool(Tool):
     - Supports database connections (write your own connection code)
     """
 
+    # Modules blocked when MEDDS_CODE_GATE=true
+    _BLOCKED_MODULES = {
+        'subprocess', 'socket', 'ftplib', 'smtplib', 'telnetlib',
+        'xmlrpc', 'socketserver',
+    }
+
+    # (module, attribute) pairs blocked when MEDDS_CODE_GATE=true
+    _BLOCKED_CALLS = {
+        ('os', 'system'), ('os', 'popen'), ('os', 'execv'), ('os', 'execve'),
+        ('os', 'execvp'), ('os', 'execvpe'), ('os', 'spawnv'), ('os', 'spawnve'),
+        ('os', 'spawnvp'), ('os', 'spawnl'), ('os', 'spawnle'),
+    }
+
+    def _check_code_safety(self, tree: ast.AST) -> List[str]:
+        """Return list of issues if dangerous patterns are found in the AST."""
+        issues = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    top = alias.name.split('.')[0]
+                    if top in self._BLOCKED_MODULES:
+                        issues.append(f"blocked import: {alias.name}")
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    top = node.module.split('.')[0]
+                    if top in self._BLOCKED_MODULES:
+                        issues.append(f"blocked import: from {node.module}")
+            elif isinstance(node, ast.Call):
+                if (isinstance(node.func, ast.Attribute)
+                        and isinstance(node.func.value, ast.Name)):
+                    pair = (node.func.value.id, node.func.attr)
+                    if pair in self._BLOCKED_CALLS:
+                        issues.append(f"blocked call: {node.func.value.id}.{node.func.attr}()")
+        return issues
+
     def __init__(self, work_dir: str):
         """
         Initialize the Python executor.
@@ -223,6 +258,12 @@ os.chdir(WORK_DIR)
                 import traceback
                 error = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
             else:
+                # Safety gate — only active when MEDDS_CODE_GATE=true
+                if os.environ.get("MEDDS_CODE_GATE", "false").lower() in ("true", "1", "yes"):
+                    issues = self._check_code_safety(tree)
+                    if issues:
+                        return "[Blocked] Code contains restricted operations: " + "; ".join(issues)
+
                 statements = tree.body
                 for i, stmt in enumerate(statements):
                     is_last = (i == len(statements) - 1)
@@ -407,6 +448,27 @@ class RExecutorTool(Tool):
     """
     R Executor using rpy2.
     """
+
+    # Regex patterns for dangerous R calls, checked when MEDDS_CODE_GATE=true
+    _BLOCKED_R_PATTERNS = [
+        (r'\bsystem\s*\(', 'system()'),
+        (r'\bsystem2\s*\(', 'system2()'),
+        (r'\bshell\s*\(', 'shell()'),
+        (r'\bshell\.exec\s*\(', 'shell.exec()'),
+        (r'\bdownload\.file\s*\(', 'download.file()'),
+        (r'\bsocketConnection\s*\(', 'socketConnection()'),
+        (r'\burl\s*\(', 'url()'),
+    ]
+
+    def _check_r_code_safety(self, code: str) -> List[str]:
+        """Return list of issues if dangerous R patterns are found."""
+        import re
+        issues = []
+        for pattern, label in self._BLOCKED_R_PATTERNS:
+            if re.search(pattern, code):
+                issues.append(f"blocked call: {label}")
+        return issues
+
     def __init__(self, work_dir: str):
         if not HAS_RPY2:
             raise ImportError("rpy2 is not installed. Cannot use RExecutorTool.")
@@ -446,6 +508,12 @@ class RExecutorTool(Tool):
             raise ValueError("Parameter must be a dictionary with 'code' key.")
 
         code = param["code"]
+
+        # Safety gate — only active when MEDDS_CODE_GATE=true
+        if os.environ.get("MEDDS_CODE_GATE", "false").lower() in ("true", "1", "yes"):
+            issues = self._check_r_code_safety(code)
+            if issues:
+                return "[Blocked] Code contains restricted operations: " + "; ".join(issues)
 
         # Capture stdout/stderr
         # We define a custom callback to write to our string buffer
