@@ -85,7 +85,59 @@ async def root():
 @app.get("/health", tags=["Health"])
 async def health_check():
     """Health check endpoint for docker-compose, VS Code extension, and monitoring."""
-    return {"status": "ok", "service": "MedDSAgent", "port": state.port}
+    import sys
+
+    # Check R availability
+    r_available = False
+    try:
+        import rpy2.robjects  # noqa: F401
+        r_available = True
+    except ImportError:
+        pass
+
+    # Report which optional data science packages are installed
+    optional_packages = [
+        "pandas", "numpy", "scipy", "statsmodels", "sklearn",
+        "matplotlib", "seaborn", "tableone", "openpyxl", "sqlalchemy",
+        "oracledb", "docling",
+    ]
+    installed = []
+    for pkg in optional_packages:
+        try:
+            __import__(pkg)
+            installed.append(pkg)
+        except ImportError:
+            pass
+
+    return {
+        "status": "ok",
+        "service": "MedDSAgent",
+        "port": state.port,
+        "python_version": sys.version.split()[0],
+        "r_available": r_available,
+        "packages": installed,
+    }
+
+
+@app.post("/workspace/init", tags=["Health"])
+async def workspace_init():
+    """Initialize workspace structure and return metadata. Called by VS Code extension on startup."""
+    os.makedirs(state.manager.sessions_dir, exist_ok=True)
+
+    import sys
+    r_available = False
+    try:
+        import rpy2.robjects  # noqa: F401
+        r_available = True
+    except ImportError:
+        pass
+
+    return {
+        "work_dir": os.path.abspath(state.work_dir),
+        "sessions_dir": os.path.abspath(state.manager.sessions_dir),
+        "r_available": r_available,
+        "python_version": sys.version.split()[0],
+    }
 
 # =============================================================================
 # Specialty Prompt Endpoints
@@ -481,14 +533,18 @@ async def get_memory_compression(session_id: str):
 # =============================================================================
 
 def _get_session_path(session_id: str, subpath: str = "") -> str:
-    session_dir = os.path.join(state.manager.sessions_dir, session_id)
+    session_dir = os.path.normcase(os.path.realpath(
+        os.path.join(state.manager.sessions_dir, session_id)
+    ))
     if not os.path.exists(session_dir):
         raise HTTPException(status_code=404, detail="Session not found")
-    
-    target_path = os.path.abspath(os.path.join(session_dir, subpath))
-    if not target_path.startswith(session_dir):
+
+    target_path = os.path.normcase(os.path.realpath(
+        os.path.join(session_dir, subpath)
+    ))
+    if not target_path.startswith(session_dir + os.sep) and target_path != session_dir:
         raise HTTPException(status_code=403, detail="Access denied")
-    
+
     return target_path
 
 def _format_size(size: int) -> str:
