@@ -1,6 +1,6 @@
 import abc
 import uuid
-from typing import Union, Dict, List, Any
+from typing import Dict, List, Any
 from datetime import datetime
 
 
@@ -127,9 +127,11 @@ class UserStep(Step):
     
 
 class AgentStep(Step):
-    def __init__(self, agent_id: str, start_time: datetime, end_time: datetime, response: str=None, tool_name: str=None, tool_args: str=None, tool_title: str="", is_final: bool=False, step_id: str=None):
+    def __init__(self, agent_id: str, start_time: datetime, end_time: datetime,
+                 response: str = "", tools: List[Dict[str, str]] = None,
+                 is_final: bool = False, step_id: str = None):
         """
-        Assistant action step.
+        Assistant action step. Represents one complete LLM turn.
 
         Parameters:
         -----------
@@ -140,29 +142,32 @@ class AgentStep(Step):
         end_time: datetime
             The end time of the step.
         response: str, Optional
-            The assistant's response.
-        tool_name: str, Optional
-            The name of the tool to call.
-        tool_args: str, Optional
-            The serialized arguments.
-        tool_title: str, Optional
-            A one-line display summary of what the tool call does, used by the
-            frontend to label collapsed code blocks.
+            Optional interim narration text the LLM emitted alongside tool calls. 
+        tools: List[Dict[str, str]], Optional
+            All tool calls made in this LLM turn. Each entry is a dict with
+            keys: tool_name, tool_args (JSON string), tool_title.
         is_final: bool, Optional
-            Whether this step is the final answer.
+            True when the final_response tool was called, ending the round.
         step_id: str, Optional
             The unique identifier for the step.
         """
         super().__init__(start_time, end_time, step_id=step_id)
         self.agent_id = agent_id
-        self.response = response
-        self.tool_name = tool_name
-        self.tool_args = tool_args
-        self.tool_title = tool_title
+        self.response = response or ""
+        self.tools = tools if tools is not None else []
+        # Validate tools format
+        for tool in self.tools:
+            if not isinstance(tool, dict):
+                raise ValueError("Each tool must be a dictionary with 'tool_name', 'tool_args', and 'tool_title' keys.")
+            if not all(k in tool for k in ("tool_name", "tool_args", "tool_title")):
+                raise ValueError("Each tool must have 'tool_name', 'tool_args', and 'tool_title' keys.")
+            
         self.is_final = is_final
 
     def __repr__(self):
-        return (f"AgentStep(agent_id={self.agent_id}, start_time={self.start_time}, end_time={self.end_time}, response={self.response}, tool_name={self.tool_name}, tool_args={self.tool_args}, tool_title={self.tool_title}, is_final={self.is_final})")
+        return (f"AgentStep(agent_id={self.agent_id}, start_time={self.start_time}, "
+                f"end_time={self.end_time}, response={self.response!r}, "
+                f"tools={self.tools}, is_final={self.is_final})")
 
     def serialize(self) -> Dict[str, Any]:
         return {
@@ -172,10 +177,8 @@ class AgentStep(Step):
             "start_time": self.start_time.isoformat(),
             "end_time": self.end_time.isoformat(),
             "response": self.response,
-            "tool_name": self.tool_name,
-            "tool_args": self.tool_args,
-            "tool_title": self.tool_title,
-            "is_final": self.is_final
+            "tools": self.tools,
+            "is_final": self.is_final,
         }
 
     @classmethod
@@ -184,19 +187,19 @@ class AgentStep(Step):
             agent_id=data["agent_id"],
             start_time=datetime.fromisoformat(data["start_time"]),
             end_time=datetime.fromisoformat(data["end_time"]),
-            response=data["response"],
-            tool_name=data["tool_name"],
-            tool_args=data["tool_args"],
-            tool_title=data.get("tool_title", ""),
+            response=data.get("response", ""),
+            tools=data.get("tools", []),
             is_final=data.get("is_final", False),
-            step_id=data.get("step_id")
+            step_id=data.get("step_id"),
         )
     
 
 class ObservationStep(Step):
-    def __init__(self, agent_id: str, start_time: datetime, end_time: datetime, output:str, step_id: str=None):
+    def __init__(self, agent_id: str, start_time: datetime, end_time: datetime,
+                 tool_outputs: List[Dict[str, str]] = None, step_id: str = None):
         """
-        Tool output step.
+        Tool output step. If multiple tool-calls are made in a single LLM turn, 
+        one ObservationStep covers all tool outputs.
 
         Parameters:
         -----------
@@ -206,18 +209,26 @@ class ObservationStep(Step):
             The start time of the step.
         end_time: datetime
             The end time of the step.
-        output: str
-            The output from the tool that was executed.
+        tool_outputs: List[Dict[str, str]], Optional
+            Outputs for each tool executed. Each entry is a dict with keys:
+            tool_name (str) and output (str).
         step_id: str, Optional
             The unique identifier for the step.
         """
         super().__init__(start_time, end_time, step_id=step_id)
         self.agent_id = agent_id
-        self.output = output
+        self.tool_outputs = tool_outputs if tool_outputs is not None else []
+        # Validate tool_outputs format
+        for output in self.tool_outputs:
+            if not isinstance(output, dict):
+                raise ValueError("Each tool output must be a dictionary with 'tool_name' and 'output' keys.")
+            if not all(k in output for k in ("tool_name", "output")):
+                raise ValueError("Each tool output must have 'tool_name' and 'output' keys.")
 
     def __repr__(self):
-        return (f"ObservationStep(agent_id={self.agent_id}, start_time={self.start_time}, end_time={self.end_time}, output={self.output})")
-    
+        return (f"ObservationStep(agent_id={self.agent_id}, start_time={self.start_time}, "
+                f"end_time={self.end_time}, tool_outputs={self.tool_outputs})")
+
     def serialize(self) -> Dict[str, Any]:
         return {
             "type": "ObservationStep",
@@ -225,7 +236,7 @@ class ObservationStep(Step):
             "agent_id": self.agent_id,
             "start_time": self.start_time.isoformat(),
             "end_time": self.end_time.isoformat(),
-            "output": self.output
+            "tool_outputs": self.tool_outputs,
         }
 
     @classmethod
@@ -234,8 +245,8 @@ class ObservationStep(Step):
             agent_id=data["agent_id"],
             start_time=datetime.fromisoformat(data["start_time"]),
             end_time=datetime.fromisoformat(data["end_time"]),
-            output=data["output"],
-            step_id=data.get("step_id")
+            tool_outputs=data.get("tool_outputs", []),
+            step_id=data.get("step_id"),
         )
       
 

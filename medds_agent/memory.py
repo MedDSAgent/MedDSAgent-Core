@@ -165,31 +165,40 @@ class AgentMemory(abc.ABC):
 
     def _format_observation_step(self, step: ObservationStep) -> Dict[str, str]:
         """
-        Helper to format a ObservationStep into a message.
+        Helper to format an ObservationStep into a single user message.
+        All tool outputs from the same LLM turn are rendered as one block.
         """
-        if step.output:
-            content = apply_prompt_template(self.tool_call_template, {"output": step.output})
-        else:
-            content = step.output
+        header = "## System Message\nThe tool-calls from the previous step were executed.\n\n"
+        blocks = [
+            apply_prompt_template(self.tool_call_template, {
+                "tool_name": to["tool_name"],
+                "output": to["output"],
+            })
+            for to in step.tool_outputs
+        ]
         return {
             "role": "user",
+            "content": header + "\n\n".join(blocks),
+        }
+
+    def _format_agent_step(self, step: AgentStep) -> Dict[str, str]:
+        if step.tools:
+            tool_blocks = [
+                apply_prompt_template(self.agent_step_toolcall_template, {
+                    "tool_name": t["tool_name"],
+                    "tool_args": t["tool_args"],
+                })
+                for t in step.tools
+            ]
+            content = "\n\n".join(tool_blocks)
+            if step.response:
+                content = step.response + "\n\n" + content
+        else:
+            content = step.response
+        return {
+            "role": "assistant",
             "content": content,
         }
-    
-    def _format_agent_step(self, step: AgentStep) -> Dict[str, str]:
-        if step.tool_name:
-            return {
-                "role": "assistant",
-                "content": apply_prompt_template(self.agent_step_toolcall_template, {
-                    "tool_name": step.tool_name,
-                    "tool_args": step.tool_args
-                }),
-            }
-        else:
-            return {
-                "role": "assistant",
-                "content": step.response,
-            }
 
     
 class StateLessAgentMemory(AgentMemory): 
@@ -586,29 +595,9 @@ class IndexedAgentMemory(StatedAgentMemory):
                     # Middle round with compressed content available
                     compressed_content = self._compressed_cache[step.step_id]
                     if isinstance(step, ObservationStep):
-                        messages.append(self._format_observation_step(
-                            ObservationStep(
-                                agent_id=step.agent_id,
-                                start_time=step.start_time,
-                                end_time=step.end_time,
-                                output=compressed_content,
-                                step_id=step.step_id
-                            )
-                        ))
+                        messages.append({"role": "user", "content": compressed_content})
                     elif isinstance(step, AgentStep):
-                        if step.tool_name:
-                            messages.append({
-                                "role": "assistant",
-                                "content": apply_prompt_template(self.agent_step_toolcall_template, {
-                                    "tool_name": step.tool_name,
-                                    "tool_args": compressed_content
-                                }),
-                            })
-                        else:
-                            messages.append({
-                                "role": "assistant",
-                                "content": compressed_content,
-                            })
+                        messages.append({"role": "assistant", "content": compressed_content})
 
         return messages
 
@@ -686,14 +675,7 @@ class IndexedAgentMemory(StatedAgentMemory):
 
                     if isinstance(step, ObservationStep):
                         original_formatted = self._format_observation_step(step)
-                        compressed_obs = ObservationStep(
-                            agent_id=step.agent_id,
-                            start_time=step.start_time,
-                            end_time=step.end_time,
-                            output=compressed_content,
-                            step_id=step.step_id
-                        )
-                        formatted = self._format_observation_step(compressed_obs)
+                        formatted = {"role": "user", "content": compressed_content}
                         debug_messages.append(self._build_debug_entry(
                             msg_idx, formatted, step, round.round_num, "ObservationStep",
                             is_compressed=True,
@@ -701,19 +683,7 @@ class IndexedAgentMemory(StatedAgentMemory):
                         msg_idx += 1
                     elif isinstance(step, AgentStep):
                         original_formatted = self._format_agent_step(step)
-                        if step.tool_name:
-                            formatted = {
-                                "role": "assistant",
-                                "content": apply_prompt_template(self.agent_step_toolcall_template, {
-                                    "tool_name": step.tool_name,
-                                    "tool_args": compressed_content
-                                }),
-                            }
-                        else:
-                            formatted = {
-                                "role": "assistant",
-                                "content": compressed_content,
-                            }
+                        formatted = {"role": "assistant", "content": compressed_content}
                         debug_messages.append(self._build_debug_entry(
                             msg_idx, formatted, step, round.round_num, "AgentStep",
                             is_compressed=True,
