@@ -19,7 +19,7 @@ from medds_agent.memory import (
     SlideWindowAgentMemory,
     IndexedAgentMemory,
 )
-from medds_agent.tools import Tool, PythonExecutorTool, RExecutorTool, FileSystemTool, DocumentSearchTool
+from medds_agent.tools import Tool, FinalResponseTool, PythonExecutorTool, RExecutorTool, FileSystemTool, DocumentSearchTool
 from medds_agent.engines import (
     AgentBasicLLMConfig,
     AgentReasoningLLMConfig,
@@ -45,6 +45,7 @@ __all__ = [
     "IndexedAgentMemory",
     # Tools
     "Tool",
+    "FinalResponseTool",
     "PythonExecutorTool",
     "RExecutorTool",
     "FileSystemTool",

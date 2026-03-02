@@ -1195,3 +1195,50 @@ class FileSystemTool(Tool):
                 },
             },
         }
+
+
+class FinalResponseTool(Tool):
+    """
+    Internal tool that signals the agent has finished its analysis and is ready
+    to deliver a final answer to the user.
+
+    This tool is automatically injected into every agent by Agent.__init__.
+    It must be called alone (not alongside other tools). Calling it ends the
+    current round and delivers `response` as the agent's response.
+    """
+
+    def __init__(self):
+        super().__init__(
+            name="final_response",
+            description=(
+                "Call this tool when you have are ready to end the current round and deliver "
+                "your complete response to the user. This must be the only tool call in your "
+                "response — do not mix it with other tool calls."
+            )
+        )
+
+    def execute(self, param: Dict) -> str:
+        # Never executed directly; the agent intercepts this tool call.
+        return param.get("response", "")
+
+    def get_tool_call_schema(self) -> Dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "response": {
+                            "type": "string",
+                            "description": "Your complete final response to the user.",
+                        },
+                    },
+                    "required": ["response"],
+                },
+            },
+        }
+
+    def get_title(self, args: Dict) -> str:
+        return "Final Response"
