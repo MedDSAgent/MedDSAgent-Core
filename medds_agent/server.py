@@ -827,7 +827,10 @@ async def delete_file(session_id: str, file_path: str):
 
 
 def main():
+    import logging
     import uvicorn
+    log_level = os.environ.get("LOG_LEVEL", "WARNING").upper()
+    logging.basicConfig(level=getattr(logging, log_level, logging.WARNING))
     reload = os.environ.get("RELOAD", "false").lower() in ("true", "1", "yes")
     uvicorn.run("medds_agent.server:app", host=state.host, port=state.port, reload=reload)
 
