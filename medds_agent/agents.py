@@ -22,7 +22,7 @@ import uuid
 
 class Agent:
     def __init__(self, llm_engine: InferenceEngine, history:History, agent_memory: AgentMemory=None,
-                 specialty_prompt:str=None, tools:List[Tool]=None, verbose:bool=False, max_retries:int=3):
+                 specialty_prompt:str=None, tools:List[Tool]=None, verbose:bool=False, max_retries:int=8):
         """
         Agent class that executes the Action-Observation loop.
 
