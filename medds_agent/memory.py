@@ -5,7 +5,7 @@ import importlib.resources
 from typing import Dict, List, Any
 from llm_inference_engine import InferenceEngine
 from medds_agent.history import History, Step, UserStep, AgentStep, ObservationStep, SystemStep
-from medds_agent.utils import serialize_python_state, deserialize_python_state, apply_prompt_template
+from medds_agent.utils import apply_prompt_template
 
 logger = logging.getLogger(__name__)
 
@@ -444,17 +444,9 @@ class SlideWindowAgentMemory(StateLessAgentMemory):
         self.end_window_size = data["end_window_size"]
 
 class StatedAgentMemory(AgentMemory):
-    def __init__(self): 
-        """ An abstract base class for stateful memories. This is good for persistent memory storage. """ 
+    def __init__(self):
+        """ An abstract base class for stateful memories. This is good for persistent memory storage. """
         super().__init__()
-
-    def serialize(self) -> Dict[str, Any]:
-        return {
-            "python_state": serialize_python_state(self.python_state)
-        }
-
-    def deserialize(self, data: Dict[str, Any]) -> None:
-        self.python_state = deserialize_python_state(data["python_state"])
 
 
 class IndexedAgentMemory(StatedAgentMemory):
