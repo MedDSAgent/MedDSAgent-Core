@@ -428,15 +428,25 @@ async def stop_chat(session_id: str):
 
 async def _chat_stream(session_id: str, message: str):
     async def _get_env_snapshot() -> Optional[dict]:
-        """Collect current variable state for pushing through the SSE stream."""
+        """Collect current variable state for pushing through the SSE stream.
+
+        Returns None if a job is currently running — get_state() would block on
+        the worker's _sync_lock which is held by the job's background thread.
+        """
         try:
             agent = await state.manager.get_agent(session_id)
             if not agent:
                 return None
+            # Skip snapshot if any async job is in progress; get_state() would
+            # block waiting for the subprocess to finish the running job.
+            from medds_agent.tools import AsyncTool
+            if any(isinstance(t, AsyncTool) and t.job_manager.has_pending()
+                   for t in agent.tools):
+                return None
             variables: Dict[str, Any] = {}
             python_tool = next((t for t in agent.tools if isinstance(t, PythonExecutorTool)), None)
             r_tool = next((t for t in agent.tools if isinstance(t, RExecutorTool)), None)
-            # get_state() now calls the worker subprocess — run in thread to avoid blocking
+            # get_state() calls the worker subprocess — run in thread to avoid blocking event loop
             if python_tool and hasattr(python_tool, 'get_state'):
                 variables["python"] = await asyncio.to_thread(python_tool.get_state)
                 variables["language"] = "python"

@@ -375,11 +375,27 @@ class CodeWorker:
 
     def restart(self):
         """
-        Kill the current subprocess and start a fresh one.
-        Used after a cancel() to get a clean worker.
+        Force-kill the current subprocess and start a fresh one.
+        Used after a cancel() to get a clean worker immediately.
+
+        Unlike shutdown(), this does NOT send a graceful "shutdown" command
+        (which would block waiting for the _sync_lock held by the job thread).
+        Instead it terminates the process directly so the job thread unblocks,
+        then starts a new subprocess.
+
         Note: in-flight state from the killed job is lost.
         """
-        self.shutdown(wait=False)
+        if self._process is not None:
+            try:
+                self._process.terminate()
+                self._process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+                self._process.wait()
+            except Exception:
+                pass
+        self._dead = True
+        self._process = None
         self._start()
 
     def shutdown(self, wait: bool = True):

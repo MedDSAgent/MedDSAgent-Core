@@ -118,11 +118,14 @@ class JobManager:
         def _run():
             try:
                 data = self.worker.send_command_sync(method, params)
-                job.result = data.get("output", "")
-                job.status = STATUS_COMPLETED
+                # Only update if not already cancelled by cancel()
+                if job.status == STATUS_RUNNING:
+                    job.result = data.get("output", "")
+                    job.status = STATUS_COMPLETED
             except Exception as e:
-                job.error = str(e)
-                job.status = STATUS_FAILED
+                if job.status == STATUS_RUNNING:
+                    job.error = str(e)
+                    job.status = STATUS_FAILED
             finally:
                 job.completed_at = datetime.now()
                 if self._running_job_id == job_id:
