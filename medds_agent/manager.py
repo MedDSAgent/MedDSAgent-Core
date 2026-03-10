@@ -1,8 +1,8 @@
 import os
+import sys
 import uuid
 import asyncio
 import shutil
-import dill
 import json
 from datetime import datetime
 from typing import Dict, Optional, Any, Tuple
@@ -12,6 +12,8 @@ from medds_agent.history import History, SystemStep
 from medds_agent.memory import SlideWindowAgentMemory, IndexedAgentMemory
 from medds_agent.database import InternalDatabase
 from medds_agent.tools import PythonExecutorTool, RExecutorTool, FileSystemTool, DocumentSearchTool
+from medds_agent.workers import CodeWorker, WorkerStartupError
+from medds_agent.job_manager import JobManager
 
 # Import Engines for dynamic instantiation
 from medds_agent.engines import (
@@ -51,7 +53,8 @@ class SessionManager:
         # Initialize Database
         self.db = InternalDatabase(self.db_path)
         
-        # In-memory cache: {session_id: {"agent": Agent, "last_active": datetime, "persisted_steps": int}}
+        # In-memory cache: {session_id: {"agent": Agent, "worker": CodeWorker,
+        #                                "last_active": datetime, "persisted_steps": int}}
         self._cache: Dict[str, Dict[str, Any]] = {}
         self._lock = asyncio.Lock()
         
@@ -83,7 +86,7 @@ class SessionManager:
 
         # 3. Initialize Agent
         try:
-            agent, connection_info = self._init_agent_instance(session_dir, config, session_id=session_id)
+            agent, connection_info, worker = self._init_agent_instance(session_dir, config, session_id=session_id)
         except Exception as e:
             # Rollback if init fails
             if os.path.exists(session_dir):
@@ -101,10 +104,11 @@ class SessionManager:
             agent.history.add_step(system_step)
             agent.agent_memory.on_step_added(system_step)
 
-        # 5. Cache it
+        # 5. Cache it (worker is stored in the cache entry for lifecycle management)
         async with self._lock:
             self._cache[session_id] = {
                 "agent": agent,
+                "worker": worker,
                 "last_active": datetime.now(),
                 "persisted_steps": 0
             }
@@ -168,84 +172,31 @@ class SessionManager:
             specialty_prompt=config.get("specialty_prompt")
         )
 
-        # 4. Invalidate Cache to force reload with new settings
+        # 4. Invalidate Cache (shut down old worker) to force reload with new settings
         async with self._lock:
             if session_id in self._cache:
+                old_worker = self._cache[session_id].get("worker")
+                if old_worker:
+                    try:
+                        old_worker.shutdown()
+                    except Exception:
+                        pass
                 del self._cache[session_id]
 
-        # 5. If DB connection code changed (added or modified), execute it and add system step
+        # 5. If DB connection code changed (added or modified), reinject and add system step
         if new_db_code and new_db_code != old_db_code:
-            # Load the agent (this will reinitialize with new config)
+            # Load the agent (this will reinitialize with new config, including new worker)
             agent = await self._load_session_from_storage(session_id)
             if agent:
                 language = config.get("language", "python").lower()
-
-                if language == "python":
-                    # Find the python tool and get connection info
-                    python_tool = next((t for t in agent.tools if isinstance(t, PythonExecutorTool)), None)
-                    if python_tool:
-                        db_engine = python_tool._globals.get('db_engine')
-                        conn = python_tool._globals.get('conn')
-
-                        if db_engine is not None or conn is not None:
-                            connection_info = self._get_connection_info(python_tool)
-                            if connection_info:
-                                await self.add_system_message(
-                                    session_id,
-                                    f"Database connection established. Use variable '{connection_info['variable']}' ({connection_info['type']}) to query the database."
-                                )
-
-                elif language == "r":
-                    r_tool = next((t for t in agent.tools if isinstance(t, RExecutorTool)), None)
-                    if r_tool:
-                        connection_info = self._get_r_connection_info(r_tool)
-                        if connection_info:
-                            await self.add_system_message(
-                                session_id,
-                                f"Database connection established. Use variable '{connection_info['variable']}' ({connection_info['type']}) to query the database."
-                            )
-
-    def _get_connection_info(self, python_tool: PythonExecutorTool) -> Optional[Dict[str, str]]:
-        """Get connection info from PythonExecutorTool's globals."""
-        db_engine = python_tool._globals.get('db_engine')
-        conn = python_tool._globals.get('conn')
-
-        connection_info = None
-
-        if db_engine is not None:
-            engine_type = type(db_engine).__name__
-            try:
-                dialect = getattr(db_engine, 'dialect', None)
-                if dialect:
-                    dialect_name = getattr(dialect, 'name', 'unknown')
-                    engine_type = f"SQLAlchemy ({dialect_name})"
-                else:
-                    engine_type = "SQLAlchemy Engine"
-            except:
-                engine_type = "SQLAlchemy Engine"
-            connection_info = {"variable": "db_engine", "type": engine_type}
-
-        if conn is not None:
-            conn_type = type(conn).__module__ + "." + type(conn).__name__
-            if "oracledb" in conn_type.lower():
-                conn_type = "Oracle (oracledb)"
-            elif "psycopg" in conn_type.lower():
-                conn_type = "PostgreSQL (psycopg)"
-            elif "mysql" in conn_type.lower():
-                conn_type = "MySQL"
-            elif "sqlite" in conn_type.lower():
-                conn_type = "SQLite"
-            elif "pyodbc" in conn_type.lower():
-                conn_type = "ODBC"
-            else:
-                conn_type = type(conn).__name__
-
-            if connection_info:
-                connection_info = {"variable": "db_engine, conn", "type": f"{connection_info['type']} + {conn_type}"}
-            else:
-                connection_info = {"variable": "conn", "type": conn_type}
-
-        return connection_info
+                worker = self._cache.get(session_id, {}).get("worker")
+                if worker:
+                    connection_info = self._get_connection_info_from_worker(worker, language)
+                    if connection_info:
+                        await self.add_system_message(
+                            session_id,
+                            f"Database connection established. Use variable '{connection_info['variable']}' ({connection_info['type']}) to query the database."
+                        )
 
     async def run_session(self, session_id: str, user_input: str, stream: bool = False):
         """Run the agent and immediately persist state/history, with cancellation support.
@@ -311,23 +262,16 @@ class SessionManager:
             # 1. Serialize agent memory state
             agent_memory_data = agent.agent_memory.serialize()
 
-            # 2. Save Executor State (Python or R)
+            # 2. Save Executor State via worker subprocess
             session_dir = os.path.join(self.sessions_dir, session_id)
+            worker = cache_entry.get("worker")
             python_tool = next((t for t in agent.tools if isinstance(t, PythonExecutorTool)), None)
             r_tool = next((t for t in agent.tools if isinstance(t, RExecutorTool)), None)
 
-            if python_tool and hasattr(python_tool, '_globals'):
+            if python_tool and worker and worker.is_alive:
                 state_path = os.path.join(session_dir, "state.pkl")
                 try:
-                    # Filter out connection objects that can't be pickled
-                    # They will be recreated on session reload via db_connection_code
-                    state_to_save = {
-                        k: v for k, v in python_tool._globals.items()
-                        if k not in ('db_engine', 'conn')
-                    }
-                    with open(state_path, 'wb') as f:
-                        dill.dump(state_to_save, f)
-
+                    worker.send_command_sync("save_state", {"path": state_path})
                     self.db.save_session_state(
                         session_id=session_id,
                         agent_memory_data=agent_memory_data,
@@ -336,10 +280,10 @@ class SessionManager:
                 except Exception as e:
                     print(f"Error saving python state for {session_id}: {e}")
 
-            elif r_tool and hasattr(r_tool, 'save_state'):
+            elif r_tool and worker and worker.is_alive:
                 r_state_path = os.path.join(session_dir, "state.RData")
                 try:
-                    r_tool.save_state(r_state_path)
+                    worker.send_command_sync("save_state", {"path": r_state_path})
                     self.db.save_session_state(
                         session_id=session_id,
                         agent_memory_data=agent_memory_data,
@@ -368,90 +312,38 @@ class SessionManager:
             # 3. Update Timestamp
             self.db.update_last_accessed(session_id)
 
-    def _execute_db_connection_code(self, python_tool: PythonExecutorTool, code: str) -> Optional[Dict[str, str]]:
+    def _get_connection_info_from_worker(self, worker: "CodeWorker", language: str) -> Optional[Dict[str, str]]:
         """
-        Execute database connection code and inject the resulting objects into PythonExecutorTool state.
-        The code should create either 'db_engine' (SQLAlchemy) or 'conn' (direct connection) variable.
-
-        Returns:
-            Dict with connection info if successful, None if failed.
-            Example: {"variable": "db_engine", "type": "SQLAlchemy Engine"}
+        Query the worker's variable state to detect DB connection objects.
+        Works for both Python (db_engine / conn) and R (DBI connection classes).
         """
         try:
-            # Execute in the PythonExecutorTool's namespace so it persists
-            exec(code, python_tool._globals, python_tool._locals)
-            python_tool._globals.update(python_tool._locals)
-
-            # Get connection info using helper
-            connection_info = self._get_connection_info(python_tool)
-
-            if connection_info:
-                print(f"Database connection established: {connection_info['variable']} ({connection_info['type']})")
-            else:
-                print("Warning: DB connection code executed but no 'db_engine' or 'conn' created")
-
-            return connection_info
-
+            data = worker.send_command_sync("get_state", {})
+            variables = data.get("variables", [])
         except Exception as e:
-            print(f"Error executing DB connection code: {type(e).__name__}: {str(e)}")
-            # Don't raise - let the session continue without DB connection
+            print(f"Warning: Could not query worker state for connection info: {e}")
             return None
 
-    def _execute_r_db_connection_code(self, r_tool: RExecutorTool, code: str) -> Optional[Dict[str, str]]:
-        """
-        Execute R database connection code in the RExecutorTool environment.
-        The code should create a connection variable (e.g. 'con') using DBI/odbc/RPostgres etc.
-
-        Returns:
-            Dict with connection info if successful, None if failed.
-            Example: {"variable": "con", "type": "PqConnection (RPostgres)"}
-        """
-        try:
-            output = r_tool.execute({"code": code})
-
-            if "[Error]" in output:
-                print(f"Error executing R DB connection code: {output}")
-                return None
-
-            # Check the R environment for known connection classes
-            connection_info = self._get_r_connection_info(r_tool)
-
-            if connection_info:
-                print(f"R database connection established: {connection_info['variable']} ({connection_info['type']})")
-            else:
-                print("Warning: R DB connection code executed but no connection object found")
-
+        if language == "r":
+            dbi_classes = {
+                "PqConnection", "MariaDBConnection", "MySQLConnection",
+                "OraConnection", "SQLiteConnection", "OdbcConnection", "DBIConnection"
+            }
+            for var in variables:
+                var_type = var.get("type", "")
+                if any(cls in var_type for cls in dbi_classes) or "Connection" in var_type:
+                    return {"variable": var["name"], "type": var_type}
+        else:
+            # Python: look for db_engine or conn by name
+            connection_info = None
+            for var in variables:
+                name = var.get("name", "")
+                var_type = var.get("type", "")
+                if name == "db_engine":
+                    connection_info = {"variable": "db_engine", "type": f"SQLAlchemy ({var_type})"}
+                elif name == "conn" and connection_info is None:
+                    connection_info = {"variable": "conn", "type": var_type}
             return connection_info
-
-        except Exception as e:
-            print(f"Error executing R DB connection code: {type(e).__name__}: {str(e)}")
-            return None
-
-    def _get_r_connection_info(self, r_tool: RExecutorTool) -> Optional[Dict[str, str]]:
-        """Get connection info from RExecutorTool's environment."""
-        from rpy2.robjects.conversion import localconverter
-        from rpy2.robjects import pandas2ri
-        import rpy2.robjects as robjects
-
-        with localconverter(robjects.default_converter + pandas2ri.converter):
-            obj_names = list(r_tool.env.keys())
-
-            for name in obj_names:
-                obj = r_tool.env[name]
-                try:
-                    r_class_list = list(obj.rclass)
-                except:
-                    continue
-
-                # Check for DBI connection classes
-                dbi_classes = [
-                    "PqConnection", "MariaDBConnection", "MySQLConnection",
-                    "OraConnection", "Microsoft SQL Server",
-                    "SQLiteConnection", "OdbcConnection", "DBIConnection"
-                ]
-                for cls in r_class_list:
-                    if any(dbi_cls in cls for dbi_cls in dbi_classes) or "Connection" in cls:
-                        return {"variable": name, "type": cls}
 
         return None
 
@@ -468,36 +360,35 @@ class SessionManager:
         
         # 2. Initialize Agent using saved Config (connection_info ignored for reload - already in history)
         try:
-            agent, _ = self._init_agent_instance(session_dir, config, session_id=session_id)
+            agent, _, worker = self._init_agent_instance(session_dir, config, session_id=session_id)
         except Exception as e:
             print(f"Error initializing agent for {session_id}: {e}")
             return None
-        
+
         # 3. Reconstruct History
         history_steps = self.db.get_history_steps(session_id)
         history = History()
         for step in history_steps:
-            history.add_step(step) 
+            history.add_step(step)
         agent.history = history
-        
-        # 4. Load Executor State (Python or R)
+
+        # 4. Load Executor State into the worker subprocess
         python_tool = next((t for t in agent.tools if isinstance(t, PythonExecutorTool)), None)
         r_tool = next((t for t in agent.tools if isinstance(t, RExecutorTool)), None)
 
-        if python_tool:
+        if python_tool and worker and worker.is_alive:
             state_path = os.path.join(session_dir, "state.pkl")
             if os.path.exists(state_path):
                 try:
-                    with open(state_path, 'rb') as f:
-                        python_tool._globals.update(dill.load(f))
+                    worker.send_command_sync("load_state", {"path": state_path})
                 except Exception as e:
                     print(f"Warning: Failed to load Python state for {session_id}: {e}")
 
-        elif r_tool:
+        elif r_tool and worker and worker.is_alive:
             r_state_path = os.path.join(session_dir, "state.RData")
             if os.path.exists(r_state_path):
                 try:
-                    r_tool.load_state(r_state_path)
+                    worker.send_command_sync("load_state", {"path": r_state_path})
                 except Exception as e:
                     print(f"Warning: Failed to load R state for {session_id}: {e}")
 
@@ -509,33 +400,50 @@ class SessionManager:
             except Exception as e:
                 print(f"Warning: Failed to restore agent memory for {session_id}: {e}")
 
-        # 6. Cache
+        # 6. Cache (include worker for lifecycle management)
         total_steps = sum(len(r.steps) for r in history.rounds)
         async with self._lock:
             self._cache[session_id] = {
                 "agent": agent,
+                "worker": worker,
                 "last_active": datetime.now(),
                 "persisted_steps": total_steps
             }
-            
+
         return agent
 
-    def _init_agent_instance(self, session_dir: str, config: Dict[str, Any], session_id: str = None) -> Tuple[Agent, Optional[Dict[str, str]]]:
+    def _init_agent_instance(self, session_dir: str, config: Dict[str, Any], session_id: str = None) -> Tuple[Agent, Optional[Dict[str, str]], "CodeWorker"]:
         """
         Construct Agent based on dynamic configuration.
 
         Returns:
-            Tuple of (Agent, connection_info) where connection_info is None if no DB connection.
+            Tuple of (Agent, connection_info, worker) where connection_info is None if no DB connection.
         """
 
-        # 1. Configure Tools based on language
+        # 1. Spawn the appropriate subprocess worker
         language = config.get("language", "python").lower()
         connection_info = None
 
         if language == "r":
-            executor_tool = RExecutorTool(work_dir=session_dir)
+            handler_class_path = "medds_agent.worker_handlers.RHandler"
         else:
-            executor_tool = PythonExecutorTool(work_dir=session_dir)
+            handler_class_path = "medds_agent.worker_handlers.PythonHandler"
+
+        python_bin = config.get("python_bin") or os.environ.get("MEDDS_PYTHON_BIN") or sys.executable
+
+        worker = CodeWorker(
+            handler_class_path=handler_class_path,
+            python_bin=python_bin,
+            handler_kwargs={"work_dir": session_dir},
+        )
+        job_manager = JobManager(worker=worker)
+        ready_info = worker.ready_info
+
+        # 2. Configure Tools
+        if language == "r":
+            executor_tool = RExecutorTool(job_manager=job_manager, ready_info=ready_info)
+        else:
+            executor_tool = PythonExecutorTool(job_manager=job_manager, ready_info=ready_info)
 
         tools = [
             executor_tool,
@@ -546,17 +454,18 @@ class SessionManager:
         if session_id:
             tools.append(DocumentSearchTool(session_id=session_id, db=self.db))
 
-        # Execute DB connection code if provided (Python-only)
-        if language == "python" and isinstance(executor_tool, PythonExecutorTool):
-            db_connection_code = config.get("db_connection_code")
-            if db_connection_code and db_connection_code.strip():
-                connection_info = self._execute_db_connection_code(executor_tool, db_connection_code)
-
-        # Execute DB connection code if provided (R)
-        elif language == "r" and isinstance(executor_tool, RExecutorTool):
-            db_connection_code = config.get("db_connection_code")
-            if db_connection_code and db_connection_code.strip():
-                connection_info = self._execute_r_db_connection_code(executor_tool, db_connection_code)
+        # Inject DB connection code into the worker (replaces in-process exec)
+        db_connection_code = config.get("db_connection_code", "")
+        if db_connection_code and db_connection_code.strip():
+            try:
+                result = worker.send_command_sync("inject", {"code": db_connection_code})
+                if result.get("error"):
+                    print(f"Warning: DB connection code injection error: {result['error']}")
+                else:
+                    # Determine connection variable info by querying worker state
+                    connection_info = self._get_connection_info_from_worker(worker, language)
+            except Exception as e:
+                print(f"Error injecting DB connection code: {e}")
             
         # 2. Configure LLM Engine
         provider = config.get("llm_provider", "openai").lower()
@@ -654,14 +563,21 @@ class SessionManager:
             tools=tools,
             verbose=False
         )
-        return agent, connection_info
+        return agent, connection_info, worker
 
     async def list_sessions(self):
         return self.db.list_sessions()
 
     async def delete_session(self, session_id: str):
         async with self._lock:
-            self._cache.pop(session_id, None)
+            cache_entry = self._cache.pop(session_id, None)
+            if cache_entry:
+                worker = cache_entry.get("worker")
+                if worker:
+                    try:
+                        worker.shutdown()
+                    except Exception:
+                        pass
         self.db.delete_session(session_id)
         session_path = os.path.join(self.sessions_dir, session_id)
         if os.path.exists(session_path):

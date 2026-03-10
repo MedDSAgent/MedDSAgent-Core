@@ -436,11 +436,12 @@ async def _chat_stream(session_id: str, message: str):
             variables: Dict[str, Any] = {}
             python_tool = next((t for t in agent.tools if isinstance(t, PythonExecutorTool)), None)
             r_tool = next((t for t in agent.tools if isinstance(t, RExecutorTool)), None)
+            # get_state() now calls the worker subprocess — run in thread to avoid blocking
             if python_tool and hasattr(python_tool, 'get_state'):
-                variables["python"] = python_tool.get_state()
+                variables["python"] = await asyncio.to_thread(python_tool.get_state)
                 variables["language"] = "python"
             elif r_tool and hasattr(r_tool, 'get_state'):
-                variables["r"] = r_tool.get_state()
+                variables["r"] = await asyncio.to_thread(r_tool.get_state)
                 variables["language"] = "r"
             return variables
         except Exception:
@@ -487,11 +488,12 @@ async def get_variables(session_id: str):
         python_tool = next((t for t in agent.tools if isinstance(t, PythonExecutorTool)), None)
         r_tool = next((t for t in agent.tools if isinstance(t, RExecutorTool)), None)
 
+        # get_state() calls the worker subprocess — run in thread to avoid blocking
         if python_tool and hasattr(python_tool, 'get_state'):
-            variables["python"] = python_tool.get_state()
+            variables["python"] = await asyncio.to_thread(python_tool.get_state)
             variables["language"] = "python"
         elif r_tool and hasattr(r_tool, 'get_state'):
-            variables["r"] = r_tool.get_state()
+            variables["r"] = await asyncio.to_thread(r_tool.get_state)
             variables["language"] = "r"
 
         return variables

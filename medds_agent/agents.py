@@ -1,3 +1,4 @@
+import os
 import json
 import asyncio
 import logging
@@ -15,7 +16,11 @@ from rich.syntax import Syntax
 from llm_inference_engine import InferenceEngine
 from medds_agent.history import SystemStep, UserStep, AgentStep, ObservationStep, History
 from medds_agent.memory import AgentMemory, FullHistoryAgentMemory
-from medds_agent.tools import Tool, FinalResponseTool
+from medds_agent.tools import Tool, AsyncTool, FinalResponseTool, JobWaitTool, JobCancelTool
+from medds_agent.job_manager import (
+    JobManager, ToolBusyError,
+    STATUS_COMPLETED, STATUS_FAILED, STATUS_TIMED_OUT, STATUS_CANCELLED
+)
 from medds_agent.utils import apply_prompt_template
 import uuid
 
@@ -72,8 +77,24 @@ class Agent:
         # Hook to history
         self.history = history
 
+        # Auto-inject job management tools when async tools are present.
+        # Collect all unique JobManagers from AsyncTool instances so we can
+        # inject one JobWaitTool / JobCancelTool per manager.
+        user_tools = tools if tools is not None else []
+        job_managers_seen = {}
+        for t in user_tools:
+            if isinstance(t, AsyncTool):
+                jm = t.job_manager
+                if id(jm) not in job_managers_seen:
+                    job_managers_seen[id(jm)] = jm
+
+        job_mgmt_tools = []
+        for jm in job_managers_seen.values():
+            job_mgmt_tools.append(JobWaitTool(job_manager=jm))
+            job_mgmt_tools.append(JobCancelTool(job_manager=jm))
+
         # Define tools — always append FinalResponseTool as the end-of-round signal
-        self.tools = (tools if tools is not None else []) + [FinalResponseTool()]
+        self.tools = user_tools + job_mgmt_tools + [FinalResponseTool()]
 
     def reset(self):
         """
@@ -208,25 +229,78 @@ class Agent:
             self.agent_memory.on_step_added(agent_step)
 
             if is_final:
+                # Guard: cannot finalize while a background job is still running
+                for t in self.tools:
+                    if isinstance(t, AsyncTool) and t.job_manager.has_pending():
+                        running_id = t.job_manager.get_running_job_id()
+                        raise ValueError(
+                            f"Cannot call final_response while job '{running_id}' is still running. "
+                            f"Use job_wait(job_id='{running_id}', max_sec=<seconds>) to collect results, "
+                            f"or job_cancel(job_id='{running_id}') to abort."
+                        )
                 # Deliver final_response response to the frontend as a response event
                 final_response = parsed[0]["arguments"].get("response", "")
                 yield {"type": "response", "data": final_response}
                 yield {"type": "final_decision", "is_final": True}
                 return
 
-            # Execute real tools, collect outputs
-            tool_outputs = []
+            # --- Phase 1: Dispatch all tools ---
+            tool_outputs = []          # list of {"tool_name", "output"} (may have None placeholders)
+            pending_async = []         # list of (index_in_tool_outputs, job_id, tool_name)
+
             for p in real_calls:
                 tc_name, arguments, tool = p["name"], p["arguments"], p["tool"]
                 if tool is None:
-                    tool_output = f"Error: Tool '{tc_name}' not found."
+                    output = f"Error: Tool '{tc_name}' not found."
+                    tool_outputs.append({"tool_name": tc_name, "output": output})
+                    yield {"type": "tool_output", "data": output}
+                elif isinstance(tool, AsyncTool):
+                    try:
+                        job_id = tool.submit(arguments)
+                        pending_async.append((len(tool_outputs), job_id, tc_name))
+                        tool_outputs.append(None)  # placeholder; filled in Phase 2
+                    except ToolBusyError as e:
+                        output = f"Error: {str(e)}"
+                        tool_outputs.append({"tool_name": tc_name, "output": output})
+                        yield {"type": "tool_output", "data": output}
+                    except Exception as e:
+                        output = f"Error submitting '{tc_name}': {str(e)}"
+                        tool_outputs.append({"tool_name": tc_name, "output": output})
+                        yield {"type": "tool_output", "data": output}
                 else:
                     try:
-                        tool_output = str(tool.execute(arguments))
+                        output = str(tool.execute(arguments))
                     except Exception as e:
-                        tool_output = f"Error executing tool '{tc_name}': {str(e)}"
-                tool_outputs.append({"tool_name": tc_name, "output": tool_output})
-                yield {"type": "tool_output", "data": tool_output}
+                        output = f"Error executing tool '{tc_name}': {str(e)}"
+                    tool_outputs.append({"tool_name": tc_name, "output": output})
+                    yield {"type": "tool_output", "data": output}
+
+            # --- Phase 2: Auto-wait for async jobs ---
+            auto_wait_timeout = int(os.environ.get("MEDDS_AUTO_WAIT_TIMEOUT", "30"))
+            for idx, job_id, tc_name in pending_async:
+                # Find the job_manager for this tool
+                tool = next((t for t in self.tools if t.name == tc_name), None)
+                jm = tool.job_manager if isinstance(tool, AsyncTool) else None
+
+                if jm is None:
+                    output = f"Error: could not find job manager for '{tc_name}'."
+                else:
+                    job = jm.wait_sync(job_id, auto_wait_timeout)
+                    if job.status == STATUS_COMPLETED:
+                        output = job.result or "(No output)"
+                    elif job.status == STATUS_FAILED:
+                        output = f"[Job failed]\n{job.error}"
+                    elif job.status == STATUS_CANCELLED:
+                        output = f"Job '{job_id}' was cancelled."
+                    else:  # STATUS_TIMED_OUT — still running
+                        output = (
+                            f"Execution is still running (job_id: '{job_id}'). "
+                            f"Use job_wait(job_id='{job_id}', max_sec=<seconds>) to collect results "
+                            f"when ready, or job_cancel(job_id='{job_id}') to abort."
+                        )
+
+                tool_outputs[idx] = {"tool_name": tc_name, "output": output}
+                yield {"type": "tool_output", "data": output}
 
             # Record single ObservationStep for all outputs
             observation_step = ObservationStep(
@@ -318,26 +392,79 @@ class Agent:
             await self.agent_memory.on_step_added_async(agent_step)
 
             if is_final:
+                # Guard: cannot finalize while a background job is still running
+                for t in self.tools:
+                    if isinstance(t, AsyncTool) and t.job_manager.has_pending():
+                        running_id = t.job_manager.get_running_job_id()
+                        raise ValueError(
+                            f"Cannot call final_response while job '{running_id}' is still running. "
+                            f"Use job_wait(job_id='{running_id}', max_sec=<seconds>) to collect results, "
+                            f"or job_cancel(job_id='{running_id}') to abort."
+                        )
                 # Deliver final_response response to the frontend as a response event
                 final_response = parsed[0]["arguments"].get("response", "")
                 yield {"type": "response", "data": final_response}
                 yield {"type": "final_decision", "is_final": True}
                 return
 
-            # Execute real tools asynchronously, collect outputs
+            # --- Phase 1: Dispatch all tools ---
             tool_outputs = []
+            pending_async = []   # (index_in_tool_outputs, job_id, tool_name)
+
             for p in real_calls:
                 tc_name, arguments, tool = p["name"], p["arguments"], p["tool"]
                 if tool is None:
-                    tool_output = f"Error: Tool '{tc_name}' not found."
+                    output = f"Error: Tool '{tc_name}' not found."
+                    tool_outputs.append({"tool_name": tc_name, "output": output})
+                    yield {"type": "tool_output", "data": output}
+                elif isinstance(tool, AsyncTool):
+                    try:
+                        # submit() is fast (dispatches to background thread) — no await needed
+                        job_id = await asyncio.to_thread(tool.submit, arguments)
+                        pending_async.append((len(tool_outputs), job_id, tc_name))
+                        tool_outputs.append(None)  # placeholder; filled in Phase 2
+                    except ToolBusyError as e:
+                        output = f"Error: {str(e)}"
+                        tool_outputs.append({"tool_name": tc_name, "output": output})
+                        yield {"type": "tool_output", "data": output}
+                    except Exception as e:
+                        output = f"Error submitting '{tc_name}': {str(e)}"
+                        tool_outputs.append({"tool_name": tc_name, "output": output})
+                        yield {"type": "tool_output", "data": output}
                 else:
                     try:
-                        tool_output = await asyncio.to_thread(tool.execute, arguments)
-                        tool_output = str(tool_output)
+                        output = await asyncio.to_thread(tool.execute, arguments)
+                        output = str(output)
                     except Exception as e:
-                        tool_output = f"Error executing tool '{tc_name}': {str(e)}"
-                tool_outputs.append({"tool_name": tc_name, "output": tool_output})
-                yield {"type": "tool_output", "data": tool_output}
+                        output = f"Error executing tool '{tc_name}': {str(e)}"
+                    tool_outputs.append({"tool_name": tc_name, "output": output})
+                    yield {"type": "tool_output", "data": output}
+
+            # --- Phase 2: Auto-wait for async jobs ---
+            auto_wait_timeout = int(os.environ.get("MEDDS_AUTO_WAIT_TIMEOUT", "30"))
+            for idx, job_id, tc_name in pending_async:
+                tool = next((t for t in self.tools if t.name == tc_name), None)
+                jm = tool.job_manager if isinstance(tool, AsyncTool) else None
+
+                if jm is None:
+                    output = f"Error: could not find job manager for '{tc_name}'."
+                else:
+                    job = await jm.wait_async(job_id, auto_wait_timeout)
+                    if job.status == STATUS_COMPLETED:
+                        output = job.result or "(No output)"
+                    elif job.status == STATUS_FAILED:
+                        output = f"[Job failed]\n{job.error}"
+                    elif job.status == STATUS_CANCELLED:
+                        output = f"Job '{job_id}' was cancelled."
+                    else:  # STATUS_TIMED_OUT — still running
+                        output = (
+                            f"Execution is still running (job_id: '{job_id}'). "
+                            f"Use job_wait(job_id='{job_id}', max_sec=<seconds>) to collect results "
+                            f"when ready, or job_cancel(job_id='{job_id}') to abort."
+                        )
+
+                tool_outputs[idx] = {"tool_name": tc_name, "output": output}
+                yield {"type": "tool_output", "data": output}
 
             # Record single ObservationStep for all outputs
             observation_step = ObservationStep(

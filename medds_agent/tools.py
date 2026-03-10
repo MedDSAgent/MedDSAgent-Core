@@ -2,36 +2,28 @@
 Tools for the Analyst Agent.
 
 This module provides tools that the agent can use to interact with:
-- Python execution
-- R execution
-- File system exploration
+- Python execution (AsyncTool — runs in subprocess via PythonHandler)
+- R execution (AsyncTool — runs in subprocess via RHandler)
+- File system exploration (sync)
+- Document search (sync)
+- Job management: job_wait, job_cancel (sync)
 """
-import ast
 import os
 import sys
-import io
 import abc
-import base64
 import shutil
 from typing import List, Dict, Any, Optional
 
-try:
-    import rpy2.robjects as robjects
-    from rpy2.robjects.packages import importr
-    import rpy2.rinterface_lib.callbacks as rcallbacks
-    
-    # Add these imports:
-    from rpy2.robjects import pandas2ri
-    from rpy2.robjects.conversion import localconverter
-    
-    HAS_RPY2 = True
-except ImportError:
-    HAS_RPY2 = False
+from medds_agent.job_manager import JobManager, ToolBusyError
 
 
 class Tool(abc.ABC):
     """Abstract base class for all tools."""
-    
+
+    #: Override in subclasses. "sync" tools execute in-process immediately.
+    #: "async" tools submit work to a subprocess worker and return a job_id.
+    tool_type: str = "sync"
+
     def __init__(self, name: str, description: str):
         self.name = name
         self.description = description
@@ -56,365 +48,110 @@ class Tool(abc.ABC):
         """
         return args.get("title", "")
 
-class PythonExecutorTool(Tool):
+
+class AsyncTool(Tool):
     """
-    Full Python executor for local or Docker-isolated environments.
+    Base class for tools that run in a subprocess worker.
 
-    Features:
-    - Persistent state across executions (variables, imports, DataFrames)
-    - Pre-imported data science libraries
-    - Full file system access within WORK_DIR
-    - Supports database connections (write your own connection code)
+    Instead of executing in-process, AsyncTool.submit() sends work to a
+    CodeWorker subprocess and returns a job_id immediately. The agent loop
+    auto-waits for completion via JobManager.
+
+    Subclasses must implement:
+        submit(param) -> str          (returns job_id)
+        get_tool_call_schema() -> dict
     """
 
-    # Modules blocked when MEDDS_CODE_GATE=true
-    _BLOCKED_MODULES = {
-        'subprocess', 'socket', 'ftplib', 'smtplib', 'telnetlib',
-        'xmlrpc', 'socketserver',
-    }
+    tool_type: str = "async"
 
-    # (module, attribute) pairs blocked when MEDDS_CODE_GATE=true
-    _BLOCKED_CALLS = {
-        ('os', 'system'), ('os', 'popen'), ('os', 'execv'), ('os', 'execve'),
-        ('os', 'execvp'), ('os', 'execvpe'), ('os', 'spawnv'), ('os', 'spawnve'),
-        ('os', 'spawnvp'), ('os', 'spawnl'), ('os', 'spawnle'),
-    }
-
-    def _check_code_safety(self, tree: ast.AST) -> List[str]:
-        """Return list of issues if dangerous patterns are found in the AST."""
-        issues = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    top = alias.name.split('.')[0]
-                    if top in self._BLOCKED_MODULES:
-                        issues.append(f"blocked import: {alias.name}")
-            elif isinstance(node, ast.ImportFrom):
-                if node.module:
-                    top = node.module.split('.')[0]
-                    if top in self._BLOCKED_MODULES:
-                        issues.append(f"blocked import: from {node.module}")
-            elif isinstance(node, ast.Call):
-                if (isinstance(node.func, ast.Attribute)
-                        and isinstance(node.func.value, ast.Name)):
-                    pair = (node.func.value.id, node.func.attr)
-                    if pair in self._BLOCKED_CALLS:
-                        issues.append(f"blocked call: {node.func.value.id}.{node.func.attr}()")
-        return issues
-
-    def __init__(self, work_dir: str):
+    def __init__(self, name: str, description: str, job_manager):
         """
-        Initialize the Python executor.
-
-        Parameters:
+        Parameters
         ----------
-        work_dir : str
-            The working directory for file operations.
+        job_manager : JobManager
+            The session's JobManager instance.
         """
-        self.work_dir = os.path.abspath(work_dir)
-        self.python_version = sys.version.split(" ")[0]
-        
-        # Persistent namespace for state across executions
-        self._globals: Dict[str, Any] = {
-            "__builtins__": __builtins__,
-            "WORK_DIR": self.work_dir,
-            "UPLOADS_DIR": os.path.join(self.work_dir, "uploads"),
-            "OUTPUTS_DIR": os.path.join(self.work_dir, "outputs"),
-            "INTERNAL_DIR": os.path.join(self.work_dir, "internal"),
-            "SCRIPTS_DIR": os.path.join(self.work_dir, "scripts"),
-        }
-        self._locals: Dict[str, Any] = {}
-        
-        # Pre-import common data science libraries
-        self._setup_environment()
-        
-        # Build description with available libraries
-        self.description = self._build_description()
-        super().__init__(name="PythonExecutor", description=self.description)
-    
-    def _setup_environment(self):
-        """Pre-import common libraries into the execution namespace."""
-        # Core setup - always runs
-        setup_code = f'''
-import os
-import sys
-import json
-from pathlib import Path
-from datetime import datetime, timedelta
+        super().__init__(name, description)
+        self.job_manager = job_manager
 
-WORK_DIR = "{self.work_dir}"
-UPLOADS_DIR = os.path.join(WORK_DIR, "uploads")
-OUTPUTS_DIR = os.path.join(WORK_DIR, "outputs")
-SCRIPTS_DIR = os.path.join(WORK_DIR, "scripts")
-INTERNAL_DIR = os.path.join(WORK_DIR, "internal")
-os.chdir(WORK_DIR)
-'''
-        exec(setup_code, self._globals, self._locals)
-        self._globals.update(self._locals)
-        
-        # Optional imports - fail silently if not installed
-        optional_imports = [
-            # Data manipulation
-            "import pandas as pd",
-            "import numpy as np",
-            # Statistical analysis
-            "import scipy",
-            "import statsmodels.api as statsmodels",
-            "import sklearn",
-            "import seaborn as sns",
-            "import tableone",
-            # Excel support
-            "import openpyxl",
-            # Display settings
-            "pd.set_option('display.max_columns', 50)",
-            "pd.set_option('display.width', None)",
-            "pd.set_option('display.max_rows', 100)",
-            # Database connections
-            "from sqlalchemy import create_engine, text",
-            "import oracledb",
-            # Visualization
-            "import matplotlib.pyplot as plt",
-            "import matplotlib",
-            "matplotlib.use('Agg')",  # Non-interactive backend for server
-        ]
-        
-        for imp in optional_imports:
-            try:
-                exec(imp, self._globals, self._locals)
-                self._globals.update(self._locals)
-            except (ImportError, NameError, Exception):
-                pass
-    
-    def _build_description(self) -> str:
-        """Build a description including available libraries."""
-        available_libs = []
-        check_libs = [
-            ('pandas', 'pd'), 
-            ('numpy', 'np'), 
-            ('tableone', 'tableone'),
-            ('matplotlib', 'plt'),
-            ('seaborn', 'sns'),
-            ('scipy', 'scipy'),
-            ('sklearn', 'sklearn'),
-            ('statsmodels', 'statsmodels'),
-            ('sqlalchemy', 'SQLAlchemy'),
-            ('openpyxl', 'Excel read/write'),
-        ]
-        
-        for lib, display in check_libs:
-            try:
-                __import__(lib)
-                available_libs.append(display)
-            except ImportError:
-                pass
-        
+    def execute(self, param: Dict) -> str:
+        # AsyncTools are never called via execute() in the agent loop.
+        # The loop checks tool_type == "async" and calls submit() instead.
+        raise RuntimeError(
+            f"AsyncTool '{self.name}' does not support execute(). "
+            "The agent loop should call submit() for async tools."
+        )
+
+    @abc.abstractmethod
+    def submit(self, param: Dict) -> str:
+        """
+        Submit work to the subprocess worker.
+
+        Parameters
+        ----------
+        param : dict
+            Tool call arguments from the LLM.
+
+        Returns
+        -------
+        str
+            job_id — an opaque identifier the agent can use with job_wait / job_cancel.
+
+        Raises
+        ------
+        ToolBusyError
+            If the worker is already busy with another job.
+        """
+        raise NotImplementedError
+
+class PythonExecutorTool(AsyncTool):
+    """
+    Python code executor — runs in a persistent subprocess worker (PythonHandler).
+
+    Execution logic lives in worker_handlers.PythonHandler.
+    This class submits code to the worker via JobManager and returns a job_id.
+    The agent loop auto-waits for completion (see agents.py).
+    """
+
+    def __init__(self, job_manager: JobManager, ready_info: Optional[Dict] = None):
+        """
+        Parameters
+        ----------
+        job_manager : JobManager
+            The session's JobManager, backed by a PythonHandler worker.
+        ready_info : dict, optional
+            The startup handshake payload from CodeWorker (available_libs, python_version).
+            Used to build the tool description.
+        """
+        ready_info = ready_info or {}
+        python_version = ready_info.get("python_version", sys.version.split(" ")[0])
+        available_libs = ready_info.get("available_libs", [])
         libs_str = ", ".join(available_libs) if available_libs else "standard library"
 
-        return (
-            f"Executes Python {self.python_version} code with full permissions. "
+        description = (
+            f"Executes Python {python_version} code with full permissions. "
             f"State persists across calls (variables, imports, DataFrames). "
             f"Use `print()` to output results. "
             f"Pre-imported: {libs_str}. "
-            f"Directories: UPLOADS_DIR for user files, OUTPUTS_DIR for agent outputs, SCRIPTS_DIR for scripts shared with user, INTERNAL_DIR for internal use. "
+            f"Directories: UPLOADS_DIR for user files, OUTPUTS_DIR for agent outputs, "
+            f"SCRIPTS_DIR for scripts shared with user, INTERNAL_DIR for internal use. "
             f"For database connections, use the pre-configured `db_engine` or `conn` object if available in state."
         )
-    
-    def execute(self, param: Dict) -> str:
-        """
-        Execute Python code with full permissions.
-        
-        Parameters:
-        ----------
-        param : Dict
-            Must contain 'code' key with Python code string.
-        
-        Returns:
-        -------
-        str
-            Captured stdout/stderr and the repr of the last expression if any.
-        """
+        super().__init__(name="PythonExecutor", description=description, job_manager=job_manager)
+
+    def submit(self, param: Dict) -> str:
         if not isinstance(param, dict) or "code" not in param:
             raise ValueError("Parameter must be a dictionary with 'code' key.")
-        
-        code = param["code"]
-        
-        # Capture stdout and stderr
-        old_stdout = sys.stdout
-        old_stderr = sys.stderr
-        sys.stdout = captured_stdout = io.StringIO()
-        sys.stderr = captured_stderr = io.StringIO()
-        
-        result = None
-        error = None
-
-        try:
-            # Parse the entire code block upfront to catch syntax errors and split
-            # into individual top-level statements for statement-by-statement execution.
-            # This ensures variables from successful statements are committed to the
-            # environment even when a later statement raises an error.
-            try:
-                tree = ast.parse(code)
-            except SyntaxError as e:
-                import traceback
-                error = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
-            else:
-                # Safety gate — only active when MEDDS_CODE_GATE=true
-                if os.environ.get("MEDDS_CODE_GATE", "false").lower() in ("true", "1", "yes"):
-                    issues = self._check_code_safety(tree)
-                    if issues:
-                        return "[Blocked] Code contains restricted operations: " + "; ".join(issues)
-
-                statements = tree.body
-                for i, stmt in enumerate(statements):
-                    is_last = (i == len(statements) - 1)
-                    try:
-                        if is_last and isinstance(stmt, ast.Expr):
-                            # Last statement is a bare expression: evaluate it so
-                            # its value is returned (mirrors the original eval() path).
-                            expr_code = compile(
-                                ast.Expression(body=stmt.value), '<string>', 'eval'
-                            )
-                            result = eval(expr_code, self._globals, self._locals)
-                        else:
-                            stmt_code = compile(
-                                ast.Module(body=[stmt], type_ignores=[]), '<string>', 'exec'
-                            )
-                            exec(stmt_code, self._globals, self._locals)
-                        # Persist state after every successful statement.
-                        self._globals.update(self._locals)
-                    except Exception as e:
-                        import traceback
-                        error = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
-                        break  # Stop at first error; prior statements are already in env
-        finally:
-            sys.stdout = old_stdout
-            sys.stderr = old_stderr
-        
-        # Build output
-        output_parts = []
-        
-        stdout_content = captured_stdout.getvalue()
-        stderr_content = captured_stderr.getvalue()
-        
-        if stdout_content:
-            output_parts.append(stdout_content.rstrip())
-        
-        if stderr_content:
-            output_parts.append(f"[stderr]\n{stderr_content.rstrip()}")
-        
-        if error:
-            output_parts.append(f"[Error]\n{error}")
-        elif result is not None:
-            output_parts.append(self._format_result(result))
-        
-        return "\n".join(output_parts) if output_parts else "(No output)"
-    
-    def _format_result(self, result: Any) -> str:
-        """Format execution result for display."""
-        # Handle DataFrames specially
-        if hasattr(result, 'to_string'):
-            try:
-                # Limit output size
-                if hasattr(result, 'shape'):
-                    rows = result.shape[0]
-                    cols = result.shape[1] if len(result.shape) == 2 else 1
-                    if rows > 50:
-                        return f"DataFrame with {rows} rows x {cols} columns:\n{result.head(25).to_string()}\n...\n{result.tail(25).to_string()}"
-                return result.to_string(max_rows=50)
-            except Exception:
-                pass
-        
-        # Handle large collections
-        result_str = repr(result)
-        if len(result_str) > 4000:
-            return f"{result_str[:4000]}...\n(output truncated, {len(result_str)} chars total)"
-        
-        return result_str
+        return self.job_manager.submit(
+            tool_name=self.name,
+            method="execute",
+            params={"code": param["code"]},
+        )
 
     def get_state(self) -> List[Dict[str, Any]]:
-        """Get current variable state with metadata for UI."""
-        # Filter out builtins and system variables
-        excluded = {'__builtins__', 'WORK_DIR', 'UPLOADS_DIR', 'OUTPUTS_DIR', 'SCRIPTS_DIR', 'INTERNAL_DIR', 'quit', 'exit', 'get_ipython'}
-        state_data = []
-        
-        for k, v in self._globals.items():
-            if k.startswith('_') or k in excluded:
-                continue
-            
-            # Determine basic type info
-            type_name = type(v).__name__
-            module_name = type(v).__module__
-            full_type = f"{module_name}.{type_name}" if module_name != "builtins" else type_name
-            
-            value_info = ""
-            preview_content = ""
-            is_error = False
-
-            try:
-                # 1. Pandas DataFrame
-                if "DataFrame" in type_name or "pandas" in full_type:
-                    if hasattr(v, 'shape'):
-                        value_info = f"({v.shape[0]}x{v.shape[1]})"
-                    if hasattr(v, 'head') and hasattr(v, 'to_html'):
-                        # Render a nice Bootstrap table
-                        preview_content = v.head(500).to_html(classes='df-table', border=0, index=False)
-                
-                # 2. Matplotlib Figure
-                elif "Figure" in type_name and hasattr(v, 'savefig'):
-                    # Convert to Base64 image
-                    buf = io.BytesIO()
-                    v.savefig(buf, format='png', bbox_inches='tight')
-                    buf.seek(0)
-                    b64 = base64.b64encode(buf.read()).decode('utf-8')
-                    value_info = "Image"
-                    preview_content = f'<img src="data:image/png;base64,{b64}" style="max-width:100%; height:auto;">'
-                
-                # 3. Numpy Array
-                elif "ndarray" in type_name:
-                    if hasattr(v, 'shape'):
-                        value_info = str(v.shape)
-                    preview_content = str(v)
-
-                # 4. Modules/Functions (for filtering)
-                elif "module" == type_name or "function" == type_name or "method" in type_name:
-                    value_info = "Module/Func"
-                    preview_content = str(v)
-
-                # 5. Standard Primitives
-                else:
-                    s = str(v)
-                    # Truncate for the "value" badge
-                    value_info = s[:20] + "..." if len(s) > 20 else s
-                    # Preview gets more content but still safe
-                    preview_content = s[:2000] + ("..." if len(s) > 2000 else "")
-
-            except Exception as e:
-                is_error = True
-                value_info = "Error"
-                preview_content = f"Could not serialize: {str(e)}"
-
-            state_data.append({
-                "name": k,
-                "type": type_name,
-                "value": value_info,
-                "preview": preview_content,
-                "is_error": is_error
-            })
-            
-        return state_data
-    
-    def reset_state(self):
-        """Reset execution state to initial."""
-        self._globals = {
-            "__builtins__": __builtins__,
-            "WORK_DIR": self.work_dir,
-            "UPLOADS_DIR": os.path.join(self.work_dir, "uploads"),
-            "OUTPUTS_DIR": os.path.join(self.work_dir, "outputs"),
-            "SCRIPTS_DIR": os.path.join(self.work_dir, "scripts"),
-            "INTERNAL_DIR": os.path.join(self.work_dir, "internal"),
-        }
-        self._locals = {}
-        self._setup_environment()
+        """Fetch variable state from the worker subprocess (for UI env panel)."""
+        data = self.job_manager.worker.send_command_sync("get_state", {})
+        return data.get("variables", [])
 
     def get_tool_call_schema(self) -> Dict:
         return {
@@ -444,366 +181,50 @@ os.chdir(WORK_DIR)
             },
         }
 
-class RExecutorTool(Tool):
+
+class RExecutorTool(AsyncTool):
     """
-    R Executor using rpy2.
+    R code executor — runs in a persistent subprocess worker (RHandler).
+
+    Execution logic lives in worker_handlers.RHandler.
+    This class submits code to the worker via JobManager and returns a job_id.
+    The agent loop auto-waits for completion (see agents.py).
     """
 
-    # Regex patterns for dangerous R calls, checked when MEDDS_CODE_GATE=true
-    _BLOCKED_R_PATTERNS = [
-        (r'\bsystem\s*\(', 'system()'),
-        (r'\bsystem2\s*\(', 'system2()'),
-        (r'\bshell\s*\(', 'shell()'),
-        (r'\bshell\.exec\s*\(', 'shell.exec()'),
-        (r'\bdownload\.file\s*\(', 'download.file()'),
-        (r'\bsocketConnection\s*\(', 'socketConnection()'),
-        (r'\burl\s*\(', 'url()'),
-    ]
+    def __init__(self, job_manager: JobManager, ready_info: Optional[Dict] = None):
+        """
+        Parameters
+        ----------
+        job_manager : JobManager
+            The session's JobManager, backed by an RHandler worker.
+        ready_info : dict, optional
+            The startup handshake payload from CodeWorker (r_version, etc.).
+        """
+        ready_info = ready_info or {}
+        r_version = ready_info.get("r_version", "R")
 
-    def _check_r_code_safety(self, code: str) -> List[str]:
-        """Return list of issues if dangerous R patterns are found."""
-        import re
-        issues = []
-        for pattern, label in self._BLOCKED_R_PATTERNS:
-            if re.search(pattern, code):
-                issues.append(f"blocked call: {label}")
-        return issues
-
-    def __init__(self, work_dir: str):
-        if not HAS_RPY2:
-            raise ImportError("rpy2 is not installed. Cannot use RExecutorTool.")
-            
-        self.work_dir = os.path.abspath(work_dir)
-        self.name = "RExecutor"
-        
-        # Initialize R environment
-        # We use a specific environment to isolate variables as much as possible,
-        # although libraries are loaded globally in the embedded R process.
-        self.env = robjects.Environment()
-        
-        self.description = (
-            "Executes R code. State persists across calls within the session. "
-            "Use standard R syntax. "
-            f"Directories: UPLOADS_DIR for user files, OUTPUTS_DIR for agent outputs, SCRIPTS_DIR for scripts shared with user, INTERNAL_DIR for internal use. "
+        description = (
+            f"Executes {r_version} code. State persists across calls within the session. "
+            f"Use standard R syntax. "
+            f"Directories: UPLOADS_DIR for user files, OUTPUTS_DIR for agent outputs, "
+            f"SCRIPTS_DIR for scripts shared with user, INTERNAL_DIR for internal use."
         )
-        super().__init__(name=self.name, description=self.description)
-        
-        self._setup_environment()
+        super().__init__(name="RExecutor", description=description, job_manager=job_manager)
 
-    def _setup_environment(self):
-        """Initialize the R environment variables."""
-        # Set directory variables in R
-        self.execute({"code": f"""
-            WORK_DIR <- "{self.work_dir}"
-            UPLOADS_DIR <- file.path(WORK_DIR, "uploads")
-            OUTPUTS_DIR <- file.path(WORK_DIR, "outputs")
-            SCRIPTS_DIR <- file.path(WORK_DIR, "scripts")
-            INTERNAL_DIR <- file.path(WORK_DIR, "internal")
-            setwd(WORK_DIR)
-        """})
-
-    def execute(self, param: Dict) -> str:
-        """Execute R code."""
+    def submit(self, param: Dict) -> str:
         if not isinstance(param, dict) or "code" not in param:
             raise ValueError("Parameter must be a dictionary with 'code' key.")
-
-        code = param["code"]
-
-        # Safety gate — only active when MEDDS_CODE_GATE=true
-        if os.environ.get("MEDDS_CODE_GATE", "false").lower() in ("true", "1", "yes"):
-            issues = self._check_r_code_safety(code)
-            if issues:
-                return "[Blocked] Code contains restricted operations: " + "; ".join(issues)
-
-        # Capture stdout/stderr
-        # We define a custom callback to write to our string buffer
-        stdout_buffer = io.StringIO()
-        stderr_buffer = io.StringIO()
-
-        def write_console_ex(output, otype):
-            if otype == 0: # Output
-                stdout_buffer.write(output)
-            else: # Message/Error
-                stderr_buffer.write(output)
-
-        # Hijack rpy2 callbacks
-        # Note: rpy2 callbacks are global. In a multi-threaded server this can leak output
-        # to other threads if they run concurrently.
-        # PythonExecutor has similar issues with os.chdir.
-        original_console = rcallbacks.consolewrite_print
-
-        # Only simple write_console is exposed easily in rinterface_lib
-        # We wrap the python function to match signature
-        def print_capture(x):
-            stdout_buffer.write(x)
-
-        def warn_capture(x):
-            stderr_buffer.write(x)
-
-        rcallbacks.consolewrite_print = print_capture
-        rcallbacks.consolewrite_warnerror = warn_capture
-
-        result = None
-        error = None
-
-        try:
-            # Use localconverter to ensure rpy2 conversion rules are available
-            # in worker threads (asyncio.to_thread). The rules live in a
-            # contextvars.ContextVar that may not propagate automatically.
-            with localconverter(robjects.default_converter + pandas2ri.converter):
-                # Ensure working directory is set (race condition mitigation)
-                robjects.r(f'setwd("{self.work_dir}")')
-
-                # Parse all top-level expressions upfront to catch syntax errors.
-                # Evaluating expression-by-expression ensures variables from
-                # successful statements are committed to the R environment even
-                # when a later statement raises an error.
-                try:
-                    parsed = robjects.r.parse(text=code)
-                except Exception as e:
-                    error = str(e)
-                else:
-                    for expr in parsed:
-                        try:
-                            result = robjects.r['eval'](expr, envir=self.env)
-                        except Exception as e:
-                            error = str(e)
-                            break  # Stop at first error; prior expressions are already in env
-
-        except Exception as e:
-            error = str(e)
-        finally:
-            # Restore callbacks
-            rcallbacks.consolewrite_print = original_console
-            rcallbacks.consolewrite_warnerror = original_console  # Restore default behavior
-
-        output_parts = []
-
-        stdout_content = stdout_buffer.getvalue()
-        stderr_content = stderr_buffer.getvalue()
-
-        if stdout_content:
-            output_parts.append(stdout_content.rstrip())
-
-        if stderr_content:
-            output_parts.append(f"[stderr]\n{stderr_content.rstrip()}")
-
-        if error:
-            output_parts.append(f"[Error]\n{error}")
-        elif result is not None:
-            # Format R result
-            try:
-                # Use R's print to string
-                # We can use capture.output in R
-                with localconverter(robjects.default_converter + pandas2ri.converter):
-                    capture_res = robjects.r['capture.output'](robjects.r['print'](result))
-                res_str = "\n".join(capture_res)
-                output_parts.append(res_str)
-            except Exception:
-                output_parts.append(str(result))
-
-        return "\n".join(output_parts) if output_parts else "(No output)"
-
-    # Variables to exclude from get_state (directory paths set during _setup_environment)
-    _EXCLUDED_VARS = {'WORK_DIR', 'UPLOADS_DIR', 'OUTPUTS_DIR', 'SCRIPTS_DIR', 'INTERNAL_DIR'}
-
-    def _r_check(self, func_name: str, obj) -> bool:
-        """Call an R predicate function (e.g. is.data.frame) and return Python bool."""
-        try:
-            return bool(robjects.r[func_name](obj)[0])
-        except:
-            return False
-
-    def _r_class_str(self, obj) -> str:
-        """Get the primary R class string for an object."""
-        try:
-            cls_vec = robjects.r['class'](obj)
-            return str(cls_vec[0])
-        except:
-            return "unknown"
-
-    def _r_capture_preview(self, obj, max_chars: int = 2000) -> str:
-        """Use capture.output(print(obj)) to get a text preview."""
-        try:
-            capture_res = robjects.r['capture.output'](robjects.r['print'](obj))
-            raw = "\n".join(capture_res)
-            return raw[:max_chars]
-        except:
-            return str(obj)[:max_chars]
+        return self.job_manager.submit(
+            tool_name=self.name,
+            method="execute",
+            params={"code": param["code"]},
+        )
 
     def get_state(self) -> List[Dict[str, Any]]:
-        """Get R environment state with rich media support."""
-        state_data = []
+        """Fetch variable state from the worker subprocess (for UI env panel)."""
+        data = self.job_manager.worker.send_command_sync("get_state", {})
+        return data.get("variables", [])
 
-        # Use localconverter throughout to ensure conversion rules are available
-        # in any thread context (asyncio.to_thread workers, etc.)
-        with localconverter(robjects.default_converter + pandas2ri.converter):
-            # List objects in the environment
-            obj_names = list(self.env.keys())
-
-            for name in obj_names:
-                if name.startswith('.') or name in self._EXCLUDED_VARS:
-                    continue
-
-                obj = self.env[name]
-                r_class = self._r_class_str(obj)
-                value_info = ""
-                preview_content = ""
-                is_error = False
-
-                try:
-                    # --- 1. Handle ggplot/lattice objects (Figures) ---
-                    if self._r_check('is.ggplot', obj) if robjects.r('exists("is.ggplot")')[0] else False:
-                        r_class = "ggplot"
-                        value_info = "Plot"
-                        try:
-                            plot_func = robjects.r("""
-                            function(p) {
-                                tmp <- tempfile(fileext = ".png")
-                                png(tmp, width=600, height=400)
-                                print(p)
-                                dev.off()
-                                f <- file(tmp, "rb")
-                                data <- readBin(f, "raw", n = file.info(tmp)$size)
-                                close(f)
-                                unlink(tmp)
-                                return(data)
-                            }
-                            """)
-                            image_bytes_r = plot_func(obj)
-                            image_bytes = bytes(image_bytes_r)
-                            b64 = base64.b64encode(image_bytes).decode('utf-8')
-                            preview_content = f'<img src="data:image/png;base64,{b64}" style="max-width:100%; height:auto;">'
-                        except Exception as e:
-                            preview_content = f"Could not render plot: {str(e)}"
-
-                    # --- 2. Handle DataFrames (data.frame, tibble, data.table) ---
-                    elif self._r_check('is.data.frame', obj):
-                        r_class = "data.frame"
-                        rows = int(robjects.r['nrow'](obj)[0])
-                        cols = int(robjects.r['ncol'](obj)[0])
-                        value_info = f"({rows}x{cols})"
-                        try:
-                            head_df = robjects.r['head'](obj, n=500)
-                            pd_df = robjects.conversion.get_conversion().rpy2py(head_df)
-                            if hasattr(pd_df, 'to_html'):
-                                preview_content = pd_df.to_html(classes='df-table', border=0, index=False)
-                            else:
-                                preview_content = self._r_capture_preview(obj)
-                        except Exception as e:
-                            preview_content = self._r_capture_preview(obj)
-
-                    # --- 3. Handle Matrices ---
-                    elif self._r_check('is.matrix', obj):
-                        r_class = "matrix"
-                        try:
-                            dims = list(robjects.r['dim'](obj))
-                            value_info = f"({int(dims[0])}x{int(dims[1])})"
-                        except:
-                            value_info = ""
-                        preview_content = self._r_capture_preview(obj)
-
-                    # --- 4. Handle Arrays ---
-                    elif self._r_check('is.array', obj):
-                        r_class = "array"
-                        try:
-                            dims = [int(d) for d in robjects.r['dim'](obj)]
-                            value_info = f"({'x'.join(map(str, dims))})"
-                        except:
-                            value_info = ""
-                        preview_content = self._r_capture_preview(obj)
-
-                    # --- 5. Handle Lists (non-data.frame) ---
-                    elif self._r_check('is.list', obj):
-                        r_class = "list"
-                        try:
-                            length = int(robjects.r['length'](obj)[0])
-                            value_info = f"({length})"
-                        except:
-                            pass
-                        preview_content = self._r_capture_preview(obj)
-
-                    # --- 6. Handle Functions ---
-                    elif self._r_check('is.function', obj):
-                        r_class = "function"
-                        value_info = ""
-                        preview_content = self._r_capture_preview(obj)
-
-                    # --- 7. Handle Factors ---
-                    elif self._r_check('is.factor', obj):
-                        r_class = "factor"
-                        try:
-                            length = int(robjects.r['length'](obj)[0])
-                            n_levels = int(robjects.r['nlevels'](obj)[0])
-                            value_info = f"({length}) [{n_levels} levels]"
-                        except:
-                            pass
-                        preview_content = self._r_capture_preview(obj)
-
-                    # --- 8. Handle Vectors (numeric, integer, character, logical) ---
-                    elif self._r_check('is.atomic', obj):
-                        # Determine specific atomic type
-                        if self._r_check('is.numeric', obj):
-                            r_class = "integer" if self._r_check('is.integer', obj) else "numeric"
-                        elif self._r_check('is.character', obj):
-                            r_class = "character"
-                        elif self._r_check('is.logical', obj):
-                            r_class = "logical"
-                        else:
-                            r_class = self._r_class_str(obj)
-
-                        try:
-                            length = int(robjects.r['length'](obj)[0])
-                            value_info = f"({length})"
-                        except:
-                            pass
-
-                        # For short vectors, show the actual value
-                        try:
-                            length = int(robjects.r['length'](obj)[0])
-                            if length == 1:
-                                val = str(robjects.r['as.character'](obj)[0])
-                                value_info = val[:20] + "..." if len(val) > 20 else val
-                        except:
-                            pass
-
-                        preview_content = self._r_capture_preview(obj)
-
-                    # --- 9. Default Fallback ---
-                    else:
-                        value_info = r_class
-                        preview_content = self._r_capture_preview(obj)
-
-                except Exception as e:
-                    is_error = True
-                    value_info = "Error"
-                    preview_content = str(e)
-
-                state_data.append({
-                    "name": name,
-                    "type": r_class,
-                    "value": value_info,
-                    "preview": preview_content,
-                    "is_error": is_error
-                })
-
-        return state_data
-
-    def save_state(self, path: str):
-        """Save the R environment to a .RData file."""
-        with localconverter(robjects.default_converter + pandas2ri.converter):
-            env_keys = list(self.env.keys())
-            if env_keys:
-                robjects.r['save'](list=robjects.StrVector(env_keys), file=path, envir=self.env)
-            else:
-                robjects.r['save'](list=robjects.StrVector([]), file=path)
-
-    def load_state(self, path: str):
-        """Load an .RData file into the environment."""
-        if os.path.exists(path) and os.path.getsize(path) > 0:
-            with localconverter(robjects.default_converter + pandas2ri.converter):
-                robjects.r['load'](file=path, envir=self.env)
-    
     def get_tool_call_schema(self) -> Dict:
         return {
             "type": "function",
@@ -1192,6 +613,152 @@ class FileSystemTool(Tool):
                         },
                     },
                     "required": ["action"],
+                },
+            },
+        }
+
+
+class JobWaitTool(Tool):
+    """
+    Wait for a running async job to complete and collect its output.
+
+    Blocks (in a thread) until the job finishes or max_sec is reached.
+    Pass max_sec=0 for an instant status check with no waiting.
+
+    Automatically injected into every agent that has at least one AsyncTool.
+    """
+
+    def __init__(self, job_manager: JobManager):
+        self.job_manager = job_manager
+        super().__init__(
+            name="job_wait",
+            description=(
+                "Wait for a running background job to complete and return its output. "
+                "Use this after receiving a job_id from PythonExecutor or RExecutor "
+                "when the job did not finish within the auto-wait window. "
+                "Pass max_sec=0 to instantly check the current status without waiting."
+            ),
+        )
+
+    def execute(self, param: Dict) -> str:
+        job_id  = param.get("job_id", "").strip()
+        max_sec = float(param.get("max_sec", 60))
+
+        if not job_id:
+            return "Error: job_id is required."
+
+        job = self.job_manager.wait_sync(job_id, max_sec)
+
+        from medds_agent.job_manager import (
+            STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELLED, STATUS_TIMED_OUT
+        )
+
+        if job.status == STATUS_COMPLETED:
+            return job.result or "(No output)"
+        elif job.status == STATUS_FAILED:
+            return f"[Job failed]\n{job.error}"
+        elif job.status == STATUS_CANCELLED:
+            return f"Job '{job_id}' was cancelled."
+        elif job.status == STATUS_TIMED_OUT:
+            return (
+                f"Job '{job_id}' is still running after {max_sec}s. "
+                f"Call job_wait again with a longer max_sec, or job_cancel to abort."
+            )
+        else:
+            return f"Job '{job_id}' status: {job.status}."
+
+    def get_title(self, args: Dict) -> str:
+        job_id = args.get("job_id", "")
+        return f"Wait for job {job_id}" if job_id else "Wait for job"
+
+    def get_tool_call_schema(self) -> Dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "job_id": {
+                            "type": "string",
+                            "description": "The job_id returned by PythonExecutor or RExecutor.",
+                        },
+                        "max_sec": {
+                            "type": "number",
+                            "description": (
+                                "Maximum seconds to wait for the job to complete. "
+                                "Use 0 for an instant status check. Default: 60."
+                            ),
+                        },
+                    },
+                    "required": ["job_id"],
+                },
+            },
+        }
+
+
+class JobCancelTool(Tool):
+    """
+    Cancel a running async job.
+
+    Kills the worker subprocess and restarts it cleanly.
+    State accumulated by the cancelled job is lost.
+
+    Automatically injected into every agent that has at least one AsyncTool.
+    """
+
+    def __init__(self, job_manager: JobManager):
+        self.job_manager = job_manager
+        super().__init__(
+            name="job_cancel",
+            description=(
+                "Cancel a running background job. "
+                "The worker process is restarted — variables defined in the cancelled "
+                "execution will not be available. Use this when a job is taking too long "
+                "or you want to abandon the current execution."
+            ),
+        )
+
+    def execute(self, param: Dict) -> str:
+        job_id = param.get("job_id", "").strip()
+        if not job_id:
+            return "Error: job_id is required."
+
+        job = self.job_manager.cancel(job_id)
+
+        from medds_agent.job_manager import STATUS_CANCELLED
+        if job.status == STATUS_CANCELLED:
+            return (
+                f"Job '{job_id}' has been cancelled. "
+                f"The executor has been restarted. "
+                f"Note: any variables defined in the cancelled execution are lost."
+            )
+        else:
+            return (
+                f"Job '{job_id}' could not be cancelled (status: {job.status}). "
+                f"It may have already finished."
+            )
+
+    def get_title(self, args: Dict) -> str:
+        job_id = args.get("job_id", "")
+        return f"Cancel job {job_id}" if job_id else "Cancel job"
+
+    def get_tool_call_schema(self) -> Dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "job_id": {
+                            "type": "string",
+                            "description": "The job_id to cancel.",
+                        },
+                    },
+                    "required": ["job_id"],
                 },
             },
         }
