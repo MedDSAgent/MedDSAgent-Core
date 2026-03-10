@@ -293,8 +293,9 @@ class Agent:
                     elif job.status == STATUS_CANCELLED:
                         output = f"Job '{job_id}' was cancelled."
                     else:  # STATUS_TIMED_OUT — still running
+                        elapsed = (datetime.now() - job.submitted_at).total_seconds()
                         output = (
-                            f"Execution is still running (job_id: '{job_id}'). "
+                            f"Execution is still running (job_id: '{job_id}', elapsed: {elapsed:.1f}s). "
                             f"Use job_wait(job_id='{job_id}', max_sec=<seconds>) to collect results "
                             f"when ready, or job_cancel(job_id='{job_id}') to abort."
                         )
@@ -457,8 +458,9 @@ class Agent:
                     elif job.status == STATUS_CANCELLED:
                         output = f"Job '{job_id}' was cancelled."
                     else:  # STATUS_TIMED_OUT — still running
+                        elapsed = (datetime.now() - job.submitted_at).total_seconds()
                         output = (
-                            f"Execution is still running (job_id: '{job_id}'). "
+                            f"Execution is still running (job_id: '{job_id}', elapsed: {elapsed:.1f}s). "
                             f"Use job_wait(job_id='{job_id}', max_sec=<seconds>) to collect results "
                             f"when ready, or job_cancel(job_id='{job_id}') to abort."
                         )

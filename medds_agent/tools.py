@@ -660,8 +660,10 @@ class JobWaitTool(Tool):
         elif job.status == STATUS_CANCELLED:
             return f"Job '{job_id}' was cancelled."
         elif job.status == STATUS_TIMED_OUT:
+            from datetime import datetime
+            elapsed = (datetime.now() - job.submitted_at).total_seconds()
             return (
-                f"Job '{job_id}' is still running after {max_sec}s. "
+                f"Job '{job_id}' is still running (elapsed: {elapsed:.1f}s, waited: {max_sec}s). "
                 f"Call job_wait again with a longer max_sec, or job_cancel to abort."
             )
         else:
