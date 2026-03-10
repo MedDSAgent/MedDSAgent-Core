@@ -441,16 +441,20 @@ class Agent:
                     tool_outputs.append({"tool_name": tc_name, "output": output})
                     yield {"type": "tool_output", "data": output}
 
+            logger.debug("All tools dispatched, pending async jobs: %s", pending_async)
+
             # --- Phase 2: Auto-wait for async jobs ---
             auto_wait_timeout = int(os.environ.get("MEDDS_AUTO_WAIT_TIMEOUT", "30"))
             for idx, job_id, tc_name in pending_async:
                 tool = next((t for t in self.tools if t.name == tc_name), None)
-                jm = tool.job_manager if isinstance(tool, AsyncTool) else None
+                jm = tool.job_manager if isinstance(tool, AsyncTool) else None               
 
                 if jm is None:
                     output = f"Error: could not find job manager for '{tc_name}'."
                 else:
+                    logger.debug("Auto-waiting for job_id '%s' from tool '%s' with timeout %d seconds.", job_id, tc_name, auto_wait_timeout)
                     job = await jm.wait_async(job_id, auto_wait_timeout)
+                    logger.debug("Auto-wait completed for job_id '%s'. Status: %s", job_id, job.status)
                     if job.status == STATUS_COMPLETED:
                         output = job.result or "(No output)"
                     elif job.status == STATUS_FAILED:
@@ -820,6 +824,7 @@ class Agent:
             for attempt in range(self.max_retries):
                 try:
                     # 1. Non-blocking Chat Call (Wait for full response)
+                    logger.debug("[run_event_stream_async] attempt=%d: sending chat_async request to LLM.", attempt)
                     llm_response = await self.llm_engine.chat_async(
                         messages=messages,
                         tools=tools_schema
@@ -827,6 +832,7 @@ class Agent:
                     
                     # 2. Yield interim text only when tool calls are also present.
                     #    Text-only responses are retry cases — don't stream them.
+                    logger.debug("[run_event_stream_async] attempt=%d: received LLM response. Validating for streaming...", attempt)
                     response_text = llm_response.get('response', '') or ''
                     tool_calls = llm_response.get('tool_calls', []) or []
                     if response_text and tool_calls:
@@ -838,6 +844,7 @@ class Agent:
                         yield {"type": "response", "data": response_text}
 
                     # 3. Yield Tool Calls preview (exclude final_response — internal mechanism)
+                    logger.debug("[run_event_stream_async] attempt=%d: processing tool calls for streaming preview.", attempt)
                     visible_tool_calls = [tc for tc in tool_calls if tc.get('name') != 'final_response']
                     if visible_tool_calls:
                         enriched = []
@@ -851,6 +858,7 @@ class Agent:
                         yield {"type": "tool_calls", "data": enriched}
 
                     # 4. Process Execution (executes tools, updates history, yields outputs)
+                    logger.debug("[run_event_stream_async] attempt=%d: starting tool execution stream.", attempt)
                     is_final_answer = False
                     execution_gen = await self._process_llm_response_async(llm_response, stream=True)
 
