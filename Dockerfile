@@ -19,7 +19,7 @@ RUN pip install --no-cache-dir torch torchvision --index-url https://download.py
 
 # Install the package with all runtime extras
 COPY . .
-RUN pip install --no-cache-dir ".[server,docling,r]"
+RUN pip install --no-cache-dir ".[server,worker,docling,r]"
 
 # Workspace is mounted as a volume at runtime
 RUN mkdir -p /workspace
