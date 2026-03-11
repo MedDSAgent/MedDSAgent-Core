@@ -259,6 +259,8 @@ class Agent:
                         job_id = tool.submit(arguments)
                         pending_async.append((len(tool_outputs), job_id, tc_name))
                         tool_outputs.append(None)  # placeholder; filled in Phase 2
+                        # Yield immediately so the frontend can show code before the auto-wait
+                        yield {"type": "tool_running", "tool_name": tc_name, "data": arguments, "job_id": job_id}
                     except ToolBusyError as e:
                         output = f"Error: {str(e)}"
                         tool_outputs.append({"tool_name": tc_name, "output": output})
@@ -276,7 +278,7 @@ class Agent:
                     yield {"type": "tool_output", "data": output}
 
             # --- Phase 2: Auto-wait for async jobs ---
-            auto_wait_timeout = int(os.environ.get("MEDDS_AUTO_WAIT_TIMEOUT", "30"))
+            auto_wait_timeout = int(os.environ.get("MEDDS_AUTO_WAIT_TIMEOUT", "5"))
             for idx, job_id, tc_name in pending_async:
                 # Find the job_manager for this tool
                 tool = next((t for t in self.tools if t.name == tc_name), None)
@@ -424,6 +426,8 @@ class Agent:
                         job_id = await asyncio.to_thread(tool.submit, arguments)
                         pending_async.append((len(tool_outputs), job_id, tc_name))
                         tool_outputs.append(None)  # placeholder; filled in Phase 2
+                        # Yield immediately so the frontend can show code before the auto-wait
+                        yield {"type": "tool_running", "tool_name": tc_name, "data": arguments, "job_id": job_id}
                     except ToolBusyError as e:
                         output = f"Error: {str(e)}"
                         tool_outputs.append({"tool_name": tc_name, "output": output})
@@ -444,7 +448,7 @@ class Agent:
             logger.debug("All tools dispatched, pending async jobs: %s", pending_async)
 
             # --- Phase 2: Auto-wait for async jobs ---
-            auto_wait_timeout = int(os.environ.get("MEDDS_AUTO_WAIT_TIMEOUT", "30"))
+            auto_wait_timeout = int(os.environ.get("MEDDS_AUTO_WAIT_TIMEOUT", "5"))
             for idx, job_id, tc_name in pending_async:
                 tool = next((t for t in self.tools if t.name == tc_name), None)
                 jm = tool.job_manager if isinstance(tool, AsyncTool) else None               
