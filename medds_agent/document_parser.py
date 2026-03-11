@@ -9,10 +9,6 @@ import hashlib
 import logging
 from typing import List, Dict, Any, Optional
 
-from docling.document_converter import DocumentConverter, PdfFormatOption, InputFormat
-from docling.datamodel.pipeline_options import PdfPipelineOptions
-from docling_core.types.doc.labels import DocItemLabel
-
 from medds_agent.database import InternalDatabase
 
 logger = logging.getLogger(__name__)
@@ -50,11 +46,13 @@ class DocumentParser:
         self._converter: Optional[DocumentConverter] = None
 
     @property
-    def converter(self) -> DocumentConverter:
+    def converter(self):
         """Lazy-init the Docling converter (avoids import cost at startup)."""
         if self._converter is None:
+            from docling.document_converter import DocumentConverter, PdfFormatOption, InputFormat
+            from docling.datamodel.pipeline_options import PdfPipelineOptions
             pipeline_options = PdfPipelineOptions()
-            pipeline_options.do_ocr = False 
+            pipeline_options.do_ocr = False
             self._converter = DocumentConverter(
                 format_options={
                     InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
@@ -83,10 +81,10 @@ class DocumentParser:
         if not is_parseable(file_path):
             return False
 
-        # Check if already parsed with same hash
+        # Check if already parsed with same hash and successfully completed
         current_hash = _file_hash(file_path)
         existing = self.db.get_parsed_document(session_id, file_name)
-        if existing and existing['file_hash'] == current_hash:
+        if existing and existing['file_hash'] == current_hash and existing.get('status') == 'done':
             return True  # Already up to date
 
         try:
@@ -125,6 +123,8 @@ class DocumentParser:
         - The heading level from iterate_items() determines hierarchy.
         - If no headings are found, fall back to fixed-size chunking.
         """
+        from docling_core.types.doc.labels import DocItemLabel
+
         sections: List[Dict[str, Any]] = []
         # Stack tracks (level, section_index) for building hierarchy
         level_stack: List[tuple] = []

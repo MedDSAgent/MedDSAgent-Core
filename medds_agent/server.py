@@ -23,7 +23,7 @@ from pydantic import BaseModel
 
 from medds_agent.manager import SessionManager
 from medds_agent.tools import PythonExecutorTool, RExecutorTool
-from medds_agent.document_parser import DocumentParser, is_parseable
+from medds_agent.document_parser import is_parseable, _file_hash
 
 # =============================================================================
 # Configuration & Global State
@@ -35,7 +35,6 @@ class ServerState:
         self.host = os.environ.get("HOST", "0.0.0.0")
         self.port = int(os.environ.get("PORT", 7842))
         self.manager: Optional[SessionManager] = None
-        self.document_parser: Optional[DocumentParser] = None
 
 state = ServerState()
 
@@ -50,9 +49,6 @@ async def lifespan(app: FastAPI):
     
     # Initialize the Persistent Session Manager
     state.manager = SessionManager(work_dir=state.work_dir)
-
-    # Initialize the Document Parser (shares the same DB)
-    state.document_parser = DocumentParser(db=state.manager.db)
 
     yield
 
@@ -219,6 +215,10 @@ class ChatRequest(BaseModel):
 
 class TestConnectionRequest(BaseModel):
     code: str
+
+class IndexRequest(BaseModel):
+    file_name: str
+    path: str = "uploads"
 
 class FileInfo(BaseModel):
     name: str
@@ -604,49 +604,86 @@ async def upload_file(session_id: str, file: UploadFile = File(...), path: str =
         os.makedirs(target_dir, exist_ok=True)
         final_path = os.path.join(target_dir, file.filename)
 
-        # Stage file: write to a temp location first so the file is not
-        # visible in uploads/ until parsing is complete.
-        session_dir = os.path.join(state.manager.sessions_dir, session_id)
-        staging_dir = os.path.join(session_dir, ".staging")
-        os.makedirs(staging_dir, exist_ok=True)
-        staging_path = os.path.join(staging_dir, file.filename)
-
-        async with aiofiles.open(staging_path, 'wb') as out_file:
+        async with aiofiles.open(final_path, 'wb') as out_file:
             while chunk := await file.read(1024 * 1024):
                 await out_file.write(chunk)
 
-        # Parse document if it's a supported type (runs synchronously — user
-        # perceives this as part of the upload).  Non-parseable files skip
-        # this step and go straight to uploads/.
-        parsed = False
-        if is_parseable(staging_path):
-            parsed = await asyncio.get_event_loop().run_in_executor(
-                None,
-                state.document_parser.parse,
-                session_id,
-                staging_path,
-                file.filename,
-            )
-
-        # Move from staging to final destination
-        shutil.move(staging_path, final_path)
-
-        # Build system message
-        if parsed:
-            system_msg = (
-                f"File '{file.filename}' uploaded to '{path}'. "
-                f"This document has been parsed and indexed. "
-                f"Use DocumentSearch tool to browse its sections."
-            )
-        else:
-            system_msg = f"File '{file.filename}' uploaded to '{path}'."
-
+        system_msg = f"File '{file.filename}' uploaded to '{path}'."
         await state.manager.add_system_message(session_id, system_msg)
-        return {"status": "uploaded", "filename": file.filename, "parsed": parsed}
+        return {"status": "uploaded", "filename": file.filename}
     except Exception as e:
-        # Clean up staging file on error
-        if 'staging_path' in locals() and os.path.exists(staging_path):
-            os.remove(staging_path)
+        if 'final_path' in locals() and os.path.exists(final_path):
+            os.remove(final_path)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/sessions/{session_id}/index", tags=["Files"])
+async def index_document(session_id: str, request: IndexRequest):
+    """
+    Trigger background indexing for an uploaded file.
+
+    Returns immediately with a job_id. The agent is notified via a system
+    message. Use GET /sessions/{id}/files/{file_name}/index-status to poll
+    progress from the frontend.
+    """
+    try:
+        file_path = _get_session_path(session_id, os.path.join(request.path, request.file_name))
+
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail=f"File '{request.file_name}' not found in '{request.path}/'.")
+
+        if not is_parseable(file_path):
+            raise HTTPException(status_code=400, detail=f"'{request.file_name}' is not an indexable file type.")
+
+        # Skip re-indexing if already done with same content
+        file_hash = _file_hash(file_path)
+        existing = state.manager.db.get_parsed_document(session_id, request.file_name)
+        if existing and existing.get("file_hash") == file_hash and existing.get("status") == "done":
+            return {"status": "already_indexed", "file_name": request.file_name}
+
+        # Mark indexing started in DB so DocumentSearch shows status immediately
+        state.manager.db.mark_indexing_started(session_id, request.file_name, file_hash)
+
+        # Submit to the session's indexer worker
+        indexer_jm = await state.manager.get_indexer_job_manager(session_id)
+        if indexer_jm is None:
+            raise HTTPException(status_code=404, detail="Session not found.")
+
+        job_id = indexer_jm.submit(
+            tool_name="DocumentIndexer",
+            method="execute",
+            params={"session_id": session_id, "file_path": file_path, "file_name": request.file_name},
+        )
+
+        system_msg = (
+            f"File '{request.file_name}' is being indexed. "
+            "Use DocumentSearch → list_documents to check when indexing is complete before reading."
+        )
+        await state.manager.add_system_message(session_id, system_msg)
+        return {"status": "indexing", "job_id": job_id, "file_name": request.file_name}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/sessions/{session_id}/files/{file_name:path}/index-status", tags=["Files"])
+async def get_index_status(session_id: str, file_name: str):
+    """Return the indexing status for a specific file (for frontend polling)."""
+    try:
+        doc = state.manager.db.get_parsed_document(session_id, file_name)
+        if not doc:
+            return {"file_name": file_name, "status": "not_indexed", "section_count": 0, "error_message": None}
+        section_count = 0
+        if doc["status"] == "done":
+            section_count = len(state.manager.db.get_document_sections(doc["document_id"]))
+        return {
+            "file_name": file_name,
+            "status": doc["status"],
+            "section_count": section_count,
+            "error_message": doc.get("error_message"),
+        }
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 # =============================================================================

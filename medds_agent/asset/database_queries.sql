@@ -45,12 +45,15 @@ CREATE TABLE IF NOT EXISTS session_states (
 -- =============================================================================
 -- 4. Parsed Documents Table
 -- Tracks documents that have been parsed and indexed for search.
+-- status: 'indexing' | 'done' | 'failed'
 -- =============================================================================
 CREATE TABLE IF NOT EXISTS parsed_documents (
     document_id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,
     file_name TEXT NOT NULL,
     file_hash TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'done',
+    error_message TEXT,
     parsed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
     UNIQUE(session_id, file_name)

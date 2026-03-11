@@ -86,7 +86,7 @@ class SessionManager:
 
         # 3. Initialize Agent
         try:
-            agent, connection_info, worker = self._init_agent_instance(session_dir, config, session_id=session_id)
+            agent, connection_info, worker, indexer_worker, indexer_jm = self._init_agent_instance(session_dir, config, session_id=session_id)
         except Exception as e:
             # Rollback if init fails
             if os.path.exists(session_dir):
@@ -109,8 +109,10 @@ class SessionManager:
             self._cache[session_id] = {
                 "agent": agent,
                 "worker": worker,
+                "indexer_worker": indexer_worker,
+                "indexer_job_manager": indexer_jm,
                 "last_active": datetime.now(),
-                "persisted_steps": 0
+                "persisted_steps": 0,
             }
 
         # 6. Save session to persist the system step to database
@@ -172,15 +174,16 @@ class SessionManager:
             specialty_prompt=config.get("specialty_prompt")
         )
 
-        # 4. Invalidate Cache (shut down old worker) to force reload with new settings
+        # 4. Invalidate Cache (shut down old workers) to force reload with new settings
         async with self._lock:
             if session_id in self._cache:
-                old_worker = self._cache[session_id].get("worker")
-                if old_worker:
-                    try:
-                        old_worker.shutdown()
-                    except Exception:
-                        pass
+                for key in ("worker", "indexer_worker"):
+                    w = self._cache[session_id].get(key)
+                    if w:
+                        try:
+                            w.shutdown()
+                        except Exception:
+                            pass
                 del self._cache[session_id]
 
         # 5. If DB connection code changed (added or modified), reinject and add system step
@@ -360,7 +363,7 @@ class SessionManager:
         
         # 2. Initialize Agent using saved Config (connection_info ignored for reload - already in history)
         try:
-            agent, _, worker = self._init_agent_instance(session_dir, config, session_id=session_id)
+            agent, _, worker, indexer_worker, indexer_jm = self._init_agent_instance(session_dir, config, session_id=session_id)
         except Exception as e:
             print(f"Error initializing agent for {session_id}: {e}")
             return None
@@ -400,19 +403,21 @@ class SessionManager:
             except Exception as e:
                 print(f"Warning: Failed to restore agent memory for {session_id}: {e}")
 
-        # 6. Cache (include worker for lifecycle management)
+        # 6. Cache (include workers for lifecycle management)
         total_steps = sum(len(r.steps) for r in history.rounds)
         async with self._lock:
             self._cache[session_id] = {
                 "agent": agent,
                 "worker": worker,
+                "indexer_worker": indexer_worker,
+                "indexer_job_manager": indexer_jm,
                 "last_active": datetime.now(),
-                "persisted_steps": total_steps
+                "persisted_steps": total_steps,
             }
 
         return agent
 
-    def _init_agent_instance(self, session_dir: str, config: Dict[str, Any], session_id: str = None) -> Tuple[Agent, Optional[Dict[str, str]], "CodeWorker"]:
+    def _init_agent_instance(self, session_dir: str, config: Dict[str, Any], session_id: str = None) -> Tuple[Agent, Optional[Dict[str, str]], "CodeWorker", "CodeWorker", "JobManager"]:
         """
         Construct Agent based on dynamic configuration.
 
@@ -452,7 +457,8 @@ class SessionManager:
 
         # Add DocumentSearchTool if session_id is available
         if session_id:
-            tools.append(DocumentSearchTool(session_id=session_id, db=self.db))
+            uploads_dir = os.path.join(session_dir, "uploads")
+            tools.append(DocumentSearchTool(session_id=session_id, db=self.db, uploads_dir=uploads_dir))
 
         # Inject DB connection code into the worker (replaces in-process exec)
         db_connection_code = config.get("db_connection_code", "")
@@ -554,7 +560,15 @@ class SessionManager:
             start_window_size=start_window_size,
         )
 
-        # 4. Create Agent
+        # 4. Spawn the document indexer worker (subprocess; lazy-loads docling on first use)
+        indexer_worker = CodeWorker(
+            handler_class_path="medds_agent.worker_handlers.DocumentIndexerHandler",
+            python_bin=python_bin,
+            handler_kwargs={"db_path": self.db_path},
+        )
+        indexer_jm = JobManager(worker=indexer_worker)
+
+        # 5. Create Agent
         agent = Agent(
             llm_engine=llm_engine,
             history=History(),
@@ -563,21 +577,34 @@ class SessionManager:
             tools=tools,
             verbose=False
         )
-        return agent, connection_info, worker
+        return agent, connection_info, worker, indexer_worker, indexer_jm
 
     async def list_sessions(self):
         return self.db.list_sessions()
+
+    async def get_indexer_job_manager(self, session_id: str) -> Optional["JobManager"]:
+        """Return the document indexer JobManager for a session, loading it if needed."""
+        async with self._lock:
+            if session_id in self._cache:
+                return self._cache[session_id].get("indexer_job_manager")
+        # Not cached — load from storage (this also caches it)
+        await self._load_session_from_storage(session_id)
+        async with self._lock:
+            if session_id in self._cache:
+                return self._cache[session_id].get("indexer_job_manager")
+        return None
 
     async def delete_session(self, session_id: str):
         async with self._lock:
             cache_entry = self._cache.pop(session_id, None)
             if cache_entry:
-                worker = cache_entry.get("worker")
-                if worker:
-                    try:
-                        worker.shutdown()
-                    except Exception:
-                        pass
+                for key in ("worker", "indexer_worker"):
+                    w = cache_entry.get(key)
+                    if w:
+                        try:
+                            w.shutdown()
+                        except Exception:
+                            pass
         self.db.delete_session(session_id)
         session_path = os.path.join(self.sessions_dir, session_id)
         if os.path.exists(session_path):

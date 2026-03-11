@@ -642,6 +642,63 @@ class RHandler(WorkerHandler):
             ):
                 self._robjects.r['load'](file=path, envir=self.env)
 
+
+# ---------------------------------------------------------------------------
+# DocumentIndexerHandler
+# ---------------------------------------------------------------------------
+
+class DocumentIndexerHandler(WorkerHandler):
+    """
+    Document indexing handler — runs inside a subprocess worker.
+
+    Lazy-loads docling on first use so the main process never imports it.
+    Writes parsed sections directly to the shared SQLite database.
+
+    Supports methods:
+        execute(session_id, file_path, file_name)
+            — parse a file and store sections in the DB.
+              Returns {"output": "<summary message>"}.
+    """
+
+    def __init__(self, db_path: str, **kwargs):
+        self.db_path = db_path
+
+    def get_ready_info(self) -> Dict[str, Any]:
+        try:
+            from docling.document_converter import DocumentConverter  # noqa: F401
+            docling_available = True
+        except ImportError:
+            docling_available = False
+        return {"docling_available": docling_available}
+
+    def dispatch(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        if method == "execute":
+            return self._execute(**params)
+        raise ValueError(f"DocumentIndexerHandler: unknown method '{method}'")
+
+    def _execute(self, session_id: str, file_path: str, file_name: str) -> Dict[str, Any]:
+        from medds_agent.database import InternalDatabase
+        from medds_agent.document_parser import DocumentParser
+
+        db = InternalDatabase(self.db_path)
+        parser = DocumentParser(db=db)
+        try:
+            success = parser.parse(session_id, file_path, file_name)
+            if success:
+                doc = db.get_parsed_document(session_id, file_name)
+                section_count = len(db.get_document_sections(doc["document_id"])) if doc else 0
+                return {"output": f"Successfully indexed '{file_name}': {section_count} sections extracted."}
+            else:
+                error_msg = "File type not supported for indexing."
+                db.mark_indexing_failed(session_id, file_name, error_msg)
+                return {"output": f"'{file_name}' could not be indexed: {error_msg}"}
+        except Exception as e:
+            try:
+                db.mark_indexing_failed(session_id, file_name, str(e))
+            except Exception:
+                pass
+            raise
+
     _EXCLUDED_VARS = {'WORK_DIR', 'UPLOADS_DIR', 'OUTPUTS_DIR', 'SCRIPTS_DIR', 'INTERNAL_DIR'}
 
     def _r_check(self, func_name: str, obj) -> bool:

@@ -56,6 +56,22 @@ class InternalDatabase:
             with self._get_conn() as conn:
                 conn.executescript(schema)
                 conn.commit()
+            self._migrate_db()
+
+    def _migrate_db(self):
+        """Apply incremental schema migrations for existing databases."""
+        with self._get_conn() as conn:
+            for col, definition in [
+                ("status", "TEXT NOT NULL DEFAULT 'done'"),
+                ("error_message", "TEXT"),
+            ]:
+                try:
+                    conn.execute(
+                        f"ALTER TABLE parsed_documents ADD COLUMN {col} {definition}"
+                    )
+                    conn.commit()
+                except Exception:
+                    pass  # Column already exists
                 
     # =========================================================================
     # Session Management
@@ -281,6 +297,33 @@ class InternalDatabase:
                 (session_id,)
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def mark_indexing_started(self, session_id: str, file_name: str, file_hash: str):
+        """Insert or update a parsed_documents row with status='indexing'."""
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO parsed_documents (session_id, file_name, file_hash, status)
+                VALUES (?, ?, ?, 'indexing')
+                ON CONFLICT(session_id, file_name) DO UPDATE SET
+                    file_hash      = excluded.file_hash,
+                    status         = 'indexing',
+                    error_message  = NULL,
+                    parsed_at      = CURRENT_TIMESTAMP
+                """,
+                (session_id, file_name, file_hash),
+            )
+            conn.commit()
+
+    def mark_indexing_failed(self, session_id: str, file_name: str, error_message: str):
+        """Update status to 'failed' for a document that could not be indexed."""
+        with self._get_conn() as conn:
+            conn.execute(
+                "UPDATE parsed_documents SET status = 'failed', error_message = ? "
+                "WHERE session_id = ? AND file_name = ?",
+                (error_message, session_id, file_name),
+            )
+            conn.commit()
 
     def upsert_parsed_document(self, session_id: str, file_name: str, file_hash: str) -> int:
         """

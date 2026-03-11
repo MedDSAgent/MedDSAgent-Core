@@ -15,6 +15,7 @@ import shutil
 from typing import List, Dict, Any, Optional
 
 from medds_agent.job_manager import JobManager, ToolBusyError
+from medds_agent.document_parser import is_parseable
 
 
 class Tool(abc.ABC):
@@ -263,7 +264,7 @@ class DocumentSearchTool(Tool):
     document into context.
     """
 
-    def __init__(self, session_id: str, db):
+    def __init__(self, session_id: str, db, uploads_dir: str):
         """
         Parameters
         ----------
@@ -271,17 +272,20 @@ class DocumentSearchTool(Tool):
             The current session ID for scoping queries.
         db : InternalDatabase
             Reference to the shared database instance.
+        uploads_dir : str
+            Absolute path to the session's uploads/ directory.
         """
         self.session_id = session_id
         self.db = db
+        self.uploads_dir = uploads_dir
         self.description = (
             "Browse and read parsed document sections. "
-            "Uploaded documents (PDF, DOCX, PPTX, XLSX, Markdown, TXT) are automatically parsed into hierarchical sections on upload. "
+            "Uploaded documents (PDF, DOCX, PPTX, XLSX, Markdown, TXT) are indexed and available for search. "
             "Use this tool to explore document structure and read specific sections without loading the entire file. "
             "IMPORTANT: Always use this tool to read uploaded documents instead of FileSystem's read action. "
             "Actions: "
-            "'list_documents' - list all parsed documents; "
-            "'get_outline' - get the hierarchical section outline of a document; "
+            "'list_documents' - list all files in uploads/ with their indexing status; "
+            "'get_outline' - get the hierarchical section outline of an indexed document; "
             "'read_section' - read the content of a specific section (includes child sections)."
         )
         super().__init__(name="DocumentSearch", description=self.description)
@@ -305,24 +309,72 @@ class DocumentSearchTool(Tool):
             return f"Error: {str(e)}"
 
     def _list_documents(self) -> str:
-        docs = self.db.list_parsed_documents(self.session_id)
-        if not docs:
-            return "No parsed documents found. Upload a document (PDF, DOCX, PPTX, XLSX, MD, TXT) to get started."
+        if not os.path.exists(self.uploads_dir):
+            return "No files found in uploads/."
 
-        lines = ["Parsed documents:"]
-        for doc in docs:
-            section_count = len(self.db.get_document_sections(doc['document_id']))
-            lines.append(f"  - {doc['file_name']} ({section_count} sections, parsed at {doc['parsed_at']})")
+        files = sorted(
+            f for f in os.listdir(self.uploads_dir)
+            if os.path.isfile(os.path.join(self.uploads_dir, f)) and not f.startswith(".")
+        )
+        if not files:
+            return "No files found in uploads/."
+
+        lines = ["Files in uploads/:"]
+        for file_name in files:
+            file_path = os.path.join(self.uploads_dir, file_name)
+            if not is_parseable(file_path):
+                lines.append(f"  - {file_name}  [not indexable]")
+                continue
+            doc = self.db.get_parsed_document(self.session_id, file_name)
+            if not doc:
+                lines.append(f"  - {file_name}  [not indexed]")
+            elif doc["status"] == "indexing":
+                lines.append(f"  - {file_name}  [indexing in progress...]")
+            elif doc["status"] == "failed":
+                lines.append(f"  - {file_name}  [indexing failed]")
+            else:
+                section_count = len(self.db.get_document_sections(doc["document_id"]))
+                lines.append(f"  - {file_name}  [indexed, {section_count} sections]")
         return "\n".join(lines)
+
+    def _check_document_ready(self, file_name: str) -> Optional[str]:
+        """Return an error string if the document is not ready, or None if it is."""
+        file_path = os.path.join(self.uploads_dir, file_name)
+        if not os.path.exists(file_path):
+            return (
+                f"'{file_name}' not found in uploads/. "
+                "Use list_documents to see available files."
+            )
+        if not is_parseable(file_path):
+            _, ext = os.path.splitext(file_name)
+            return (
+                f"'{file_name}' ({ext}) is not an indexable file type. "
+                "Only PDF, DOCX, PPTX, XLSX, MD, and TXT files are indexed."
+            )
+        doc = self.db.get_parsed_document(self.session_id, file_name)
+        if not doc:
+            return f"'{file_name}' has not been indexed yet. Use list_documents to check status."
+        if doc["status"] == "indexing":
+            return (
+                f"'{file_name}' is still being indexed. "
+                "Check list_documents for status, then retry."
+            )
+        if doc["status"] == "failed":
+            return (
+                f"Indexing failed for '{file_name}'. "
+                "The document cannot be searched. Re-upload to retry."
+            )
+        return None
 
     def _get_outline(self, file_name: Optional[str]) -> str:
         if not file_name:
             return "Error: 'file' parameter is required for get_outline."
 
-        doc_record = self.db.get_parsed_document(self.session_id, file_name)
-        if not doc_record:
-            return f"Error: No parsed document found for '{file_name}'. Check list_documents for available files."
+        err = self._check_document_ready(file_name)
+        if err:
+            return f"Error: {err}"
 
+        doc_record = self.db.get_parsed_document(self.session_id, file_name)
         sections = self.db.get_document_sections(doc_record['document_id'])
         if not sections:
             return f"No sections found in '{file_name}'."
@@ -338,6 +390,10 @@ class DocumentSearchTool(Tool):
             return "Error: 'file' parameter is required for read_section."
         if not section_id:
             return "Error: 'section_id' parameter is required for read_section."
+
+        err = self._check_document_ready(file_name)
+        if err:
+            return f"Error: {err}"
 
         doc_record = self.db.get_parsed_document(self.session_id, file_name)
         if not doc_record:
