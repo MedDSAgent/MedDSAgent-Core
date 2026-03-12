@@ -121,6 +121,7 @@ class CodeWorker:
         handler_class_path: str,
         python_bin: Optional[str] = None,
         handler_kwargs: Optional[Dict[str, str]] = None,
+        env: Optional[Dict[str, str]] = None,
     ):
         """
         Parameters
@@ -134,10 +135,15 @@ class CodeWorker:
         handler_kwargs : dict, optional
             Key-value pairs passed as --key value CLI arguments to the handler.
             Example: {"work_dir": "/path/to/session"}.
+        env : dict, optional
+            Extra environment variables to inject into the subprocess.
+            Merged on top of the current process environment.
+            Example: {"R_HOME": "/path/to/conda/envs/r_env/lib/R"}.
         """
         self.handler_class_path = handler_class_path
         self.python_bin = python_bin or sys.executable
         self.handler_kwargs = handler_kwargs or {}
+        self.env = env or {}
 
         self._process: Optional[subprocess.Popen] = None
         self._ready_info: Dict[str, Any] = {}
@@ -180,6 +186,11 @@ class CodeWorker:
         cmd = self._build_cmd()
         logger.debug("CodeWorker: spawning %s", cmd)
 
+        proc_env = None
+        if self.env:
+            import os as _os
+            proc_env = {**_os.environ, **self.env}
+
         self._process = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -187,6 +198,7 @@ class CodeWorker:
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,  # line-buffered
+            env=proc_env,
         )
 
         # Read startup message (one JSON line)

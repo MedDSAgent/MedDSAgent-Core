@@ -201,6 +201,10 @@ class SessionConfig(BaseModel):
     # Specialty Prompt: domain/task-specific instructions appended to system prompt
     specialty_prompt: Optional[str] = None
 
+    # Interpreter overrides
+    python_bin: Optional[str] = None   # path to Python executable (e.g. conda env)
+    r_home: Optional[str] = None       # R_HOME for rpy2 (e.g. conda env R installation)
+
 class CreateSessionRequest(BaseModel):
     name: str
     config: SessionConfig

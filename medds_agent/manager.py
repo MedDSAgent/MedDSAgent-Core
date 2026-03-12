@@ -436,10 +436,16 @@ class SessionManager:
 
         python_bin = config.get("python_bin") or os.environ.get("MEDDS_PYTHON_BIN") or sys.executable
 
+        worker_env = {}
+        r_home = config.get("r_home") or os.environ.get("MEDDS_R_HOME")
+        if r_home:
+            worker_env["R_HOME"] = r_home
+
         worker = CodeWorker(
             handler_class_path=handler_class_path,
             python_bin=python_bin,
             handler_kwargs={"work_dir": session_dir},
+            env=worker_env or None,
         )
         job_manager = JobManager(worker=worker)
         ready_info = worker.ready_info
@@ -565,6 +571,7 @@ class SessionManager:
             handler_class_path="medds_agent.worker_handlers.DocumentIndexerHandler",
             python_bin=python_bin,
             handler_kwargs={"db_path": self.db_path},
+            env=worker_env or None,
         )
         indexer_jm = JobManager(worker=indexer_worker)
 
