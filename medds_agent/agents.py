@@ -437,6 +437,7 @@ class Agent:
                         tool_outputs.append({"tool_name": tc_name, "output": output})
                         yield {"type": "tool_output", "data": output}
                 else:
+                    yield {"type": "tool_running", "tool_name": tc_name, "data": arguments, "job_id": None}
                     try:
                         output = await asyncio.to_thread(tool.execute, arguments)
                         output = str(output)
@@ -867,7 +868,7 @@ class Agent:
                     execution_gen = await self._process_llm_response_async(llm_response, stream=True)
 
                     async for event in execution_gen:
-                        if event['type'] in ('tool_output', 'response'):
+                        if event['type'] in ('tool_output', 'response', 'tool_running'):
                             yield event
                         elif event['type'] == 'final_decision':
                             is_final_answer = event['is_final']
