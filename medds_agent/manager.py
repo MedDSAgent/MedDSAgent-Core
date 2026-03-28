@@ -155,51 +155,74 @@ class SessionManager:
         return {}
 
     async def update_session(self, session_id: str, name: str, config: Dict[str, Any]):
-        """Update session name and configuration, reinitializing DB connection if needed."""
-        # 1. Update Name in DB
-        self.db.rename_session(session_id, name)
-
-        # 2. Get old config to compare DB connection code
+        """Update session name and configuration in-place, preserving worker state."""
+        # 1. Get old config before any writes
         old_config = self.db.get_session_config(session_id) or {}
-        old_db_code = (old_config.get("db_connection_code") or "").strip()
-        new_db_code = (config.get("db_connection_code") or "").strip()
 
-        # 3. Update Config in DB
+        # 2. Guard: language/python_bin/r_home are immutable after session creation
+        immutable_keys = ("language", "python_bin", "r_home")
+        for key in immutable_keys:
+            old_val = (old_config.get(key) or "").strip()
+            new_val = (config.get(key) or "").strip()
+            if old_val and new_val and old_val != new_val:
+                raise ValueError(
+                    f"Cannot change '{key}' after session creation. "
+                    f"Current value: '{old_val}', requested value: '{new_val}'."
+                )
+
+        # 3. Update Name and Config in DB
+        self.db.rename_session(session_id, name)
         self.db.save_session_config(session_id, config)
-
-        # 3b. Save specialty to dedicated columns
         self.db.save_session_specialty(
             session_id,
             specialty_id=config.get("specialty_id"),
             specialty_prompt=config.get("specialty_prompt")
         )
 
-        # 4. Invalidate Cache (shut down old workers) to force reload with new settings
+        # 4. If session is not cached, nothing more to do — next load will use new DB config
         async with self._lock:
-            if session_id in self._cache:
-                for key in ("worker", "indexer_worker"):
-                    w = self._cache[session_id].get(key)
-                    if w:
-                        try:
-                            w.shutdown()
-                        except Exception:
-                            pass
-                del self._cache[session_id]
+            cached = session_id in self._cache
+            if cached:
+                cache_entry = self._cache[session_id]
+                agent = cache_entry["agent"]
+                worker = cache_entry.get("worker")
 
-        # 5. If DB connection code changed (added or modified), reinject and add system step
+        if not cached:
+            return
+
+        language = config.get("language", "python").lower()
+
+        # 5. LLM config update — swap engine in-place
+        llm_keys = {"llm_provider", "llm_model", "llm_api_key", "llm_base_url",
+                    "llm_api_version", "temperature", "top_p", "reasoning_effort"}
+        if any(old_config.get(k) != config.get(k) for k in llm_keys):
+            new_engine = self._build_llm_engine(config)
+            agent.llm_engine = new_engine
+            agent.agent_memory._llm_engine = new_engine
+
+        # 6. Specialty prompt update
+        if (old_config.get("specialty_prompt") != config.get("specialty_prompt") or
+                old_config.get("specialty_id") != config.get("specialty_id")):
+            agent.agent_memory.set_system_prompt(agent.system_prompt, config.get("specialty_prompt"))
+
+        # 7. DB connection code update — inject into existing worker (no restart)
+        old_db_code = (old_config.get("db_connection_code") or "").strip()
+        new_db_code = (config.get("db_connection_code") or "").strip()
         if new_db_code and new_db_code != old_db_code:
-            # Load the agent (this will reinitialize with new config, including new worker)
-            agent = await self._load_session_from_storage(session_id)
-            if agent:
-                language = config.get("language", "python").lower()
-                worker = self._cache.get(session_id, {}).get("worker")
-                if worker:
-                    connection_info = self._get_connection_info_from_worker(worker, language)
-                    if connection_info:
-                        await self.add_system_message(
-                            session_id,
-                            f"Database connection established. Use variable '{connection_info['variable']}' ({connection_info['type']}) to query the database."
-                        )
+            if worker:
+                try:
+                    result = worker.send_command_sync("inject", {"code": new_db_code})
+                    if result.get("error"):
+                        print(f"Warning: DB connection code injection error: {result['error']}")
+                    else:
+                        connection_info = self._get_connection_info_from_worker(worker, language)
+                        if connection_info:
+                            await self.add_system_message(
+                                session_id,
+                                f"Database connection established. Use variable '{connection_info['variable']}' ({connection_info['type']}) to query the database."
+                            )
+                except Exception as e:
+                    print(f"Error injecting DB connection code: {e}")
 
     async def run_session(self, session_id: str, user_input: str, stream: bool = False):
         """Run the agent and immediately persist state/history, with cancellation support.
@@ -480,80 +503,7 @@ class SessionManager:
                 print(f"Error injecting DB connection code: {e}")
             
         # 2. Configure LLM Engine
-        provider = config.get("llm_provider", "openai").lower()
-        model = config.get("llm_model", "gpt-4")
-        api_key = config.get("llm_api_key")
-        base_url = config.get("llm_base_url")
-        
-        # Get sampling parameters from config
-        temperature = float(config.get("temperature", 1.0))
-        top_p = float(config.get("top_p", 1.0))
-        
-        # Get max_new_tokens from env variable
-        max_new_tokens = int(os.environ.get("LLM_MAX_NEW_TOKENS", "16384"))
-        max_input_tokens = int(os.environ.get("LLM_MAX_INPUT_TOKENS", "120000"))
-        
-        # Select LLM config based on reasoning effort
-        reasoning_effort = config.get("reasoning_effort")
-        if reasoning_effort and reasoning_effort in ["low", "medium", "high"]:
-            llm_config = AgentReasoningLLMConfig(
-                max_input_tokens=max_input_tokens
-            )
-        else:
-            llm_config = AgentBasicLLMConfig(
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                max_input_tokens=max_input_tokens
-            )
-        
-        llm_engine = None
-        
-        # Base Arguments for all engines
-        engine_kwargs = {
-            "model": model, 
-            "config": llm_config
-        }
-        
-        # Only add optional arguments if they are not None
-        if api_key:
-            engine_kwargs["api_key"] = api_key
-            # For OpenAI, also set env var if provided
-            if provider == "openai":
-                os.environ["OPENAI_API_KEY"] = api_key
-            if provider == "azure":
-                os.environ["AZURE_OPENAI_API_KEY"] = api_key
-
-        if base_url:
-            if provider == "azure":
-                engine_kwargs["azure_endpoint"] = base_url
-            else:
-                engine_kwargs["base_url"] = base_url
-        
-        # Provider Dispatch
-        if provider == "openai":
-            llm_engine = OpenAIInferenceEngine(**engine_kwargs)
-            
-        elif provider == "azure":
-            # Azure needs api_version specifically
-            if config.get("llm_api_version"):
-                engine_kwargs["api_version"] = config.get("llm_api_version")
-            else:
-                engine_kwargs["api_version"] = "2023-12-01-preview" # Fallback if not in config
-                
-            llm_engine = AzureOpenAIInferenceEngine(**engine_kwargs)
-            
-        elif provider == "vllm":
-            llm_engine = VLLMInferenceEngine(**engine_kwargs)
-            
-        elif provider == "sglang":
-            llm_engine = SGLangInferenceEngine(**engine_kwargs)
-            
-        elif provider == "openrouter":
-            llm_engine = OpenRouterInferenceEngine(**engine_kwargs)
-            
-        else:
-            raise ValueError(f"Unsupported LLM provider: {provider}")
+        llm_engine = self._build_llm_engine(config)
 
         # 3. Create Agent Memory
         start_window_size = int(os.environ.get("MEMORY_START_WINDOW_SIZE", "5"))
@@ -585,6 +535,58 @@ class SessionManager:
             verbose=False
         )
         return agent, connection_info, worker, indexer_worker, indexer_jm
+
+    def _build_llm_engine(self, config: Dict[str, Any]):
+        """Construct and return an LLM inference engine from a session config dict."""
+        provider = config.get("llm_provider", "openai").lower()
+        model = config.get("llm_model", "gpt-4")
+        api_key = config.get("llm_api_key")
+        base_url = config.get("llm_base_url")
+
+        temperature = float(config.get("temperature", 1.0))
+        top_p = float(config.get("top_p", 1.0))
+        max_new_tokens = int(os.environ.get("LLM_MAX_NEW_TOKENS", "16384"))
+        max_input_tokens = int(os.environ.get("LLM_MAX_INPUT_TOKENS", "120000"))
+
+        reasoning_effort = config.get("reasoning_effort")
+        if reasoning_effort and reasoning_effort in ["low", "medium", "high"]:
+            llm_config = AgentReasoningLLMConfig(max_input_tokens=max_input_tokens)
+        else:
+            llm_config = AgentBasicLLMConfig(
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                max_input_tokens=max_input_tokens
+            )
+
+        engine_kwargs = {"model": model, "config": llm_config}
+
+        if api_key:
+            engine_kwargs["api_key"] = api_key
+            if provider == "openai":
+                os.environ["OPENAI_API_KEY"] = api_key
+            if provider == "azure":
+                os.environ["AZURE_OPENAI_API_KEY"] = api_key
+
+        if base_url:
+            if provider == "azure":
+                engine_kwargs["azure_endpoint"] = base_url
+            else:
+                engine_kwargs["base_url"] = base_url
+
+        if provider == "openai":
+            return OpenAIInferenceEngine(**engine_kwargs)
+        elif provider == "azure":
+            engine_kwargs["api_version"] = config.get("llm_api_version") or "2023-12-01-preview"
+            return AzureOpenAIInferenceEngine(**engine_kwargs)
+        elif provider == "vllm":
+            return VLLMInferenceEngine(**engine_kwargs)
+        elif provider == "sglang":
+            return SGLangInferenceEngine(**engine_kwargs)
+        elif provider == "openrouter":
+            return OpenRouterInferenceEngine(**engine_kwargs)
+        else:
+            raise ValueError(f"Unsupported LLM provider: {provider}")
 
     async def list_sessions(self):
         return self.db.list_sessions()
