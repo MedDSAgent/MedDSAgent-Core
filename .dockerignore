@@ -6,9 +6,13 @@ __pycache__
 *.pyo
 *.egg-info
 .eggs
-dist
-build
+dist/
+build/
 .env
 workspace/
 *.pkl
 *.RData
+node_modules/
+tests/
+medds_agent/
+pyproject.toml

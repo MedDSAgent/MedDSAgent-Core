@@ -1,37 +1,68 @@
-FROM python:3.11-slim
+# ============================================================
+# Stage 1 — TypeScript build
+# ============================================================
+FROM node:22-slim AS builder
 
+# better-sqlite3 native addon requires Python + build tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential \
-        git \
-        # imaging libs required by docling
-        libgl1 \
-        libglib2.0-0 \
-        # R runtime required by rpy2
-        r-base \
-        r-base-dev \
+        python3 \
+        make \
+        g++ \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install CPU-only PyTorch BEFORE docling so the resolver does not pull
-# in the large CUDA build (~2 GB) when docling lists torch as a dependency.
-RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
+COPY package*.json ./
+RUN npm ci
 
-# Install the package with all runtime extras
-COPY . .
-RUN pip install --no-cache-dir ".[server,worker,docling,r]"
+COPY tsconfig.json ./
+COPY src/ ./src/
+COPY prompts/ ./prompts/
+COPY scripts/ ./scripts/
+RUN npm run build
 
-# Workspace is mounted as a volume at runtime
+# ============================================================
+# Stage 2 — Runtime image
+# ============================================================
+FROM node:22-slim AS runtime
+
+# Python runtime for the data-science subprocess workers
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 \
+        python3-pip \
+        python3-dev \
+        build-essential \
+        wget \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Compiled JS + prompts
+COPY --from=builder /app/dist         ./dist
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/package.json ./package.json
+
+# Python worker package (spawned as subprocess by WorkerProcess)
+COPY python_worker/ ./python_worker/
+
+# Install Python worker dependencies (requirements.txt is the source of truth)
+RUN pip3 install --no-cache-dir --break-system-packages \
+        -r python_worker/requirements.txt
+
+# Workspace volume — mount a host directory here at runtime
 RUN mkdir -p /workspace
 VOLUME /workspace
 
 ENV WORK_DIR=/workspace
 ENV HOST=0.0.0.0
 ENV PORT=7842
+# Use the system python3 for the Python worker subprocess
+ENV MEDDS_PYTHON_BIN=python3
 
 EXPOSE 7842
 
-HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:7842/health')"
+# Node 22 has built-in fetch; no extra tooling needed for healthcheck
+HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
+    CMD wget -qO- http://localhost:7842/health || exit 1
 
-CMD ["medds-server"]
+CMD ["node", "dist/cli/index.js", "serve"]

@@ -1,5 +1,6 @@
 medds_agent.egg-info/
 .vscode/
+.github/
 .claude/
 build/
 __pycache__/
@@ -7,3 +8,9 @@ __pycache__/
 *.pyo
 workspace/
 .env
+
+# TypeScript / Node
+node_modules/
+dist/
+*.tsbuildinfo
+.eslintcache
