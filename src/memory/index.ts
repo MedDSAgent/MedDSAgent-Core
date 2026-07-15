@@ -428,7 +428,7 @@ export class IndexedAgentMemory extends AgentMemory {
     this.compressedCache.set(step.stepId, COMPRESSED_PREFIX + result.response);
   }
 
-  onStepAdded(step: Step): void {
+  onStepAdded(_step: Step): void {
     // Sync compression is not supported — no-op (use onStepAddedAsync in the agent loop)
   }
 

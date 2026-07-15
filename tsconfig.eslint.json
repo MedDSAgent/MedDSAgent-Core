@@ -1,0 +1,12 @@
+// Lint-only project. tsconfig.json is the build config: it sets rootDir to src/
+// and includes only src/**, so type-aware linting of tests/ and scripts/ fails
+// against it. This widens the file set without touching build output.
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "noEmit": true
+  },
+  "include": ["src/**/*", "tests/**/*", "*.ts", "scripts/**/*"],
+  "exclude": ["node_modules", "dist"]
+}

@@ -3,33 +3,19 @@ import { spawnSync } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import { fileURLToPath } from "url";
 
-// We test the CLI by running the compiled entry point or via tsx.
-// Since the package is ESM, use `node --experimental-vm-modules` or tsx.
-// Simplest: invoke `node dist/cli/index.js` after a build — but we don't
-// want to require a build in tests. Use the source via `tsx` shim instead.
+// The CLI is exercised from source via tsx, so these tests do not require a build.
+// tsx is a devDependency: if it is missing the run must fail loudly rather than skip.
 
-const CLI_ARGS_BASE = [
-  "--input-type=module",
-  "--import",
-  "tsx/esm",                // tsx ESM hook — available via npx if not installed
-];
-
-// Detect tsx availability
-function hasTsx(): boolean {
-  const r = spawnSync("npx", ["tsx", "--version"], { encoding: "utf8", timeout: 5000 });
-  return r.status === 0;
-}
-
-const TSX = hasTsx();
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 function runCli(args: string[], cwd?: string): { stdout: string; stderr: string; status: number | null } {
-  // Run via: node --input-type=module --import tsx/esm src/cli/index.ts <args>
   const result = spawnSync(
     "npx",
     ["tsx", "src/cli/index.ts", ...args],
     {
-      cwd: cwd ?? "/home/daviden1013/David_projects/MedDSAgent-Core",
+      cwd: cwd ?? REPO_ROOT,
       encoding: "utf8",
       timeout: 15000,
       env: { ...process.env, FORCE_COLOR: "0" },
@@ -42,7 +28,7 @@ function runCli(args: string[], cwd?: string): { stdout: string; stderr: string;
   };
 }
 
-describe.skipIf(!TSX)("CLI smoke tests", () => {
+describe("CLI smoke tests", () => {
   let tmpDir: string;
 
   beforeAll(() => {

@@ -1,1 +1,82 @@
-This is a medical data science agent project.
+# MedDSAgent-Core
+
+The orchestration backend for MedDSAgent, a medical data science agent.
+
+The agent runtime is TypeScript and has no data-science language runtime of its
+own. Language execution happens in **pluggable subprocess workers**, so a user
+installs only the runtime they actually intend to use — and a chat-only user
+installs none at all. Python is not required to run the agent.
+
+## Architecture
+
+```
+┌──────────────────────────────────────────┐
+│ Agent runtime (Node / TypeScript)        │
+│   history · memory · engines · agent     │
+│   loop · jobs · session manager          │
+└───────────────┬──────────────────────────┘
+                │ JSON-line IPC over stdin/stdout
+                │ (docs/worker-protocol.md)
+    ┌───────────┴────────────┐
+    │                        │
+┌───▼──────────┐   ┌─────────▼────┐
+│ python_worker│   │ r_worker     │
+│ (PythonHandler)  │ (RHandler)   │
+└──────────────┘   └──────────────┘
+```
+
+The same codebase serves three targets:
+
+| Target | Entry point |
+|--------|-------------|
+| VS Code extension | `createSessionManager(opts)` — in-process library, no HTTP sidecar |
+| Docker / server | `startServer(opts)` — Fastify HTTP + SSE |
+| CLI | `meddsagent serve` / `meddsagent chat` |
+
+## Requirements
+
+- **Node ≥ 24.** The internal database uses the built-in `node:sqlite`, which is
+  only available unflagged from Node 24 onward. There are no native addons and no
+  build toolchain needed.
+- **Python** only if you use the Python executor tool. Install
+  `python_worker/requirements.txt` into whichever interpreter you point the agent at.
+
+## Quick start
+
+```bash
+npm install
+npm run build
+node dist/cli/index.js serve --work-dir ./workspace --port 7842
+```
+
+See [run_note.md](run_note.md) for the interactive chat invocation.
+
+## Docs
+
+- [docs/in-process-api.md](docs/in-process-api.md) — the library API the VS Code extension consumes
+- [docs/worker-protocol.md](docs/worker-protocol.md) — the JSON-line IPC contract every language worker implements
+
+## Development
+
+```bash
+npm run typecheck   # tsc --noEmit
+npm test            # vitest run
+npm run lint
+```
+
+## Legacy Python implementation
+
+This project was originally written in Python. That implementation has been
+removed from `main` and is preserved at the **`python-final`** tag:
+
+```bash
+git show python-final:medds_agent/agents.py
+git checkout python-final    # browse the full Python tree
+```
+
+The rewrite deliberately dropped some things that existed in the Python version:
+the Anthropic / Ollama / HuggingFace LLM engines, and the docling-based document
+parser with its `DocumentSearch` RAG tool. LLM support is now OpenAI-compatible
+endpoints (via `--base-url`) plus Azure OpenAI. Document RAG is deferred and will
+return as its own subprocess worker rather than as agent-side code; the last
+Python implementation of it is at `python-final`.

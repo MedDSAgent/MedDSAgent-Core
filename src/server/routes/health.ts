@@ -13,12 +13,20 @@ export const healthRoutes: FastifyPluginAsync<Opts> = async (fastify, opts) => {
   });
 
   fastify.get("/health", async () => {
+    // Report the port actually bound, not $PORT — the CLI passes --port as an
+    // option, so the env var is routinely unset or stale.
+    const address = fastify.server.address();
+    const port =
+      typeof address === "object" && address !== null
+        ? address.port
+        : parseInt(process.env["PORT"] ?? "7842", 10);
+
     return {
       status: "ok",
       service: "MedDSAgent",
       runtime: "node",
       node_version: process.version,
-      port: parseInt(process.env["PORT"] ?? "7842", 10),
+      port,
     };
   });
 

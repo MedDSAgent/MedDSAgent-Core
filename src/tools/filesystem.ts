@@ -18,9 +18,9 @@ export class FileSystemTool extends Tool {
     const description =
       "Interact with the file system. You can list, read, write, and delete files " +
       "within the 'scripts/', 'uploads/', 'outputs/', and 'internal/' directories. " +
-      "IMPORTANT: Do NOT use this tool to read uploaded documents (PDF, DOCX, PPTX, XLSX, MD, TXT). " +
-      "Use the DocumentSearch tool instead, which provides parsed and indexed access to document sections. " +
-      "This tool is intended for code files, scripts, and small text files only.";
+      "Reads are text-only: use it for code, scripts, and plain-text data files. " +
+      "Binary documents (PDF, DOCX, PPTX, XLSX) cannot be read this way — load those " +
+      "with an appropriate library via the code execution tool instead.";
     super("FileSystem", description);
     this.dir = path.resolve(workDir);
     this.maxReadSize = maxReadSize;

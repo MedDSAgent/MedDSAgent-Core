@@ -1,8 +1,5 @@
-medds_agent.egg-info/
 .vscode/
-.github/
 .claude/
-build/
 __pycache__/
 *.pyc
 *.pyo

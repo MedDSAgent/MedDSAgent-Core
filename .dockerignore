@@ -14,5 +14,3 @@ workspace/
 *.RData
 node_modules/
 tests/
-medds_agent/
-pyproject.toml

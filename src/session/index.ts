@@ -71,22 +71,24 @@ export class SessionManager implements ISessionManager {
     const sessionId = randomUUID();
     const sessionDir = path.join(this.sessionsDir, sessionId);
 
-    // 1. File system scaffold
-    for (const sub of ["uploads", "outputs", "scripts", "internal"]) {
-      fs.mkdirSync(path.join(sessionDir, sub), { recursive: true });
-    }
-
-    // 2. DB entry
-    this.db.createSession(sessionId, name, sessionDir, config as Record<string, unknown>);
-    this.db.saveSessionSpecialty(
-      sessionId,
-      (config.specialty_id as string | null) ?? null,
-      (config.specialty_prompt as string | null) ?? null,
-    );
-
-    // 3. Init agent (may throw — roll back on failure)
+    // Steps 1–3 all roll back together: a failure in any of them (including a
+    // malformed config) must not leave an orphaned session row behind.
     let entry: CacheEntry;
     try {
+      // 1. File system scaffold
+      for (const sub of ["uploads", "outputs", "scripts", "internal"]) {
+        fs.mkdirSync(path.join(sessionDir, sub), { recursive: true });
+      }
+
+      // 2. DB entry
+      this.db.createSession(sessionId, name, sessionDir, config as Record<string, unknown>);
+      this.db.saveSessionSpecialty(
+        sessionId,
+        (config.specialty_id as string | null) ?? null,
+        (config.specialty_prompt as string | null) ?? null,
+      );
+
+      // 3. Init agent
       entry = await this._initCacheEntry(sessionId, sessionDir, config);
     } catch (err) {
       fs.rmSync(sessionDir, { recursive: true, force: true });

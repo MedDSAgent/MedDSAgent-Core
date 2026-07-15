@@ -1,14 +1,9 @@
 # ============================================================
 # Stage 1 — TypeScript build
 # ============================================================
-FROM node:22-slim AS builder
-
-# better-sqlite3 native addon requires Python + build tools
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 \
-        make \
-        g++ \
-    && rm -rf /var/lib/apt/lists/*
+# Node 24: the DB layer uses the built-in node:sqlite, which is only
+# available unflagged from Node 24 onward.
+FROM node:24-slim AS builder
 
 WORKDIR /app
 
@@ -24,7 +19,7 @@ RUN npm run build
 # ============================================================
 # Stage 2 — Runtime image
 # ============================================================
-FROM node:22-slim AS runtime
+FROM node:24-slim AS runtime
 
 # Python runtime for the data-science subprocess workers
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -61,7 +56,7 @@ ENV MEDDS_PYTHON_BIN=python3
 
 EXPOSE 7842
 
-# Node 22 has built-in fetch; no extra tooling needed for healthcheck
+# wget is installed above for the healthcheck
 HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
     CMD wget -qO- http://localhost:7842/health || exit 1
 

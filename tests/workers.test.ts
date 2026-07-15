@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll } from "vitest";
+import { describe, it, expect } from "vitest";
 import { spawnSync } from "child_process";
 import * as os from "os";
 import * as path from "path";

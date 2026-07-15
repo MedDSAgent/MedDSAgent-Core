@@ -7,7 +7,6 @@ Each class is launched by python_worker.entry via:
 Available handlers:
     PythonHandler   — persistent Python execution environment
     RHandler        — persistent R execution environment via rpy2
-    DocumentIndexerHandler — document indexing via docling (deferred/optional)
 """
 
 import ast
@@ -763,61 +762,3 @@ class RHandler(WorkerHandler):
                 })
 
         return state_data
-
-
-# ---------------------------------------------------------------------------
-# DocumentIndexerHandler — deferred (docling / RAG, post-MVP)
-# ---------------------------------------------------------------------------
-
-class DocumentIndexerHandler(WorkerHandler):
-    """
-    Document indexing handler via docling.
-
-    Note: This handler is deferred (post-MVP). It still imports from
-    medds_agent.database and medds_agent.document_parser, which will be
-    resolved when docling RAG support is added as a proper subprocess tool.
-
-    Supports methods:
-        execute(session_id, file_path, file_name)
-    """
-
-    def __init__(self, db_path: str, **kwargs):
-        self.db_path = db_path
-
-    def get_ready_info(self) -> Dict[str, Any]:
-        try:
-            from docling.document_converter import DocumentConverter  # noqa: F401
-            docling_available = True
-        except ImportError:
-            docling_available = False
-        return {"docling_available": docling_available}
-
-    def dispatch(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        if method == "execute":
-            return self._execute(**params)
-        raise ValueError(f"DocumentIndexerHandler: unknown method '{method}'")
-
-    def _execute(self, session_id: str, file_path: str, file_name: str) -> Dict[str, Any]:
-        # These imports remain pointing at medds_agent until docling support is
-        # ported as a proper subprocess tool in a post-MVP phase.
-        from medds_agent.database import InternalDatabase  # type: ignore[import]
-        from medds_agent.document_parser import DocumentParser  # type: ignore[import]
-
-        db = InternalDatabase(self.db_path)
-        parser = DocumentParser(db=db)
-        try:
-            success = parser.parse(session_id, file_path, file_name)
-            if success:
-                doc = db.get_parsed_document(session_id, file_name)
-                section_count = len(db.get_document_sections(doc["document_id"])) if doc else 0
-                return {"output": f"Successfully indexed '{file_name}': {section_count} sections extracted."}
-            else:
-                error_msg = "File type not supported for indexing."
-                db.mark_indexing_failed(session_id, file_name, error_msg)
-                return {"output": f"'{file_name}' could not be indexed: {error_msg}"}
-        except Exception as e:
-            try:
-                db.mark_indexing_failed(session_id, file_name, str(e))
-            except Exception:
-                pass
-            raise

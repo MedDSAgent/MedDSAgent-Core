@@ -2,6 +2,15 @@
 
 This document is the implementation brief for porting MedDSAgent-Core from Python to TypeScript. It is self-contained: an agent picking this up should not need any prior conversation context.
 
+> **Status: the rewrite is complete and the Python sources have been removed from `main`.**
+> Everything below is ticked except the five items listed in §10, which are the only
+> outstanding work. Sections 1–6 are kept as the historical record of why the port was
+> built the way it was.
+>
+> **All `medds_agent/…` paths in this document are dead links on `main`.** The Python
+> tree they refer to is preserved at the **`python-final`** tag; read them there, e.g.
+> `git show python-final:medds_agent/agents.py`.
+
 ---
 
 ## 1. Goal
@@ -32,9 +41,9 @@ The TS code must support **both** modes from one codebase:
 
 ## 4. Stack decisions (locked)
 
-- **Node** ≥ 20, **TypeScript** strict mode
+- **Node** ≥ 24, **TypeScript** strict mode (was ≥ 20 — see `node:sqlite` below)
 - **Fastify** for HTTP + SSE (chosen over Express for: built-in schema validation via TypeBox, async-first error handling, faster SSE primitives, ~2–3× perf)
-- **better-sqlite3** for the internal DB (drop-in for current SQLite usage)
+- ~~**better-sqlite3** for the internal DB~~ → **`node:sqlite`** (built-in). Superseded during Phase 1: the built-in covers the same usage with no native addon, which removes the C++ toolchain from the Docker build and from every contributor's install. Cost: it is unflagged only on Node ≥ 24, so that is now the floor.
 - **openai** SDK (covers OpenAI native + Azure OpenAI with one client)
 - **execa** for subprocess management of language workers
 - **zod** for tool-call schema validation and LLM JSON parsing
@@ -91,9 +100,9 @@ Each phase ends with a working, tested checkpoint. Do not skip ahead — later p
 
 ### Phase 0 — Scaffold
 
-- [ ] Initialize `package.json`, `tsconfig.json` (strict mode), `.gitignore` additions for `node_modules/`, `dist/`
-- [ ] Set up Vitest, ESLint, Prettier
-- [ ] Create directory layout:
+- [x] Initialize `package.json`, `tsconfig.json` (strict mode), `.gitignore` additions for `node_modules/`, `dist/`
+- [x] Set up Vitest, ESLint, Prettier
+- [x] Create directory layout:
   ```
   src/
     history/
@@ -112,81 +121,81 @@ Each phase ends with a working, tested checkpoint. Do not skip ahead — later p
   tests/
   docs/
   ```
-- [ ] Move [medds_agent/worker_entry.py](medds_agent/worker_entry.py) and [medds_agent/worker_handlers.py](medds_agent/worker_handlers.py) into `python_worker/` as a small standalone package. Update its module paths and ensure it still runs via `python -m python_worker.entry <HandlerClass> --work_dir ...`.
-- [ ] Move [medds_agent/asset/prompt_templates/](medds_agent/asset/prompt_templates/) → `prompts/`. Build process should copy them into `dist/prompts/`.
-- [ ] Write `docs/worker-protocol.md` documenting the JSON-line IPC contract by reading the current Python implementation. Include: startup handshake (`get_ready_info`), command dispatch shape, response shape, error shape, cancellation.
-- [ ] CI: run `tsc --noEmit` + `vitest run` on push.
+- [x] Move [medds_agent/worker_entry.py](medds_agent/worker_entry.py) and [medds_agent/worker_handlers.py](medds_agent/worker_handlers.py) into `python_worker/` as a small standalone package. Update its module paths and ensure it still runs via `python -m python_worker.entry <HandlerClass> --work_dir ...`.
+- [x] Move [medds_agent/asset/prompt_templates/](medds_agent/asset/prompt_templates/) → `prompts/`. Build process should copy them into `dist/prompts/`.
+- [x] Write `docs/worker-protocol.md` documenting the JSON-line IPC contract by reading the current Python implementation. Include: startup handshake (`get_ready_info`), command dispatch shape, response shape, error shape, cancellation.
+- [x] CI: run `tsc --noEmit` + `vitest run` on push.
 
 ### Phase 1 — Foundations (no LLM yet)
 
-- [ ] Port [history.py](medds_agent/history.py) → `src/history/`. Step union (`UserStep | AgentStep | ObservationStep | SystemStep`), `Round`, `History` class. JSON serialization round-trip tested.
-- [ ] Port [database.py](medds_agent/database.py) → `src/db/`. Same SQLite schema. Wrap better-sqlite3. Test: create session, write/read history, write/read config.
-- [ ] Port [engines.py](medds_agent/engines.py) → `src/engines/`. Implement `OpenAIEngine` (covers any OpenAI-compatible endpoint: OpenAI, vLLM, SGLang, OpenRouter, etc.) and `AzureOpenAIEngine`. Common interface with `chat(messages, tools)` returning `{ response, tool_calls }`. Tool-call argument normalization (LLMs sometimes return strings vs objects — match Python behavior).
-- [ ] Port prompt template loader (current Python uses `importlib.resources`). TS equivalent: read from `prompts/` dir relative to package root, with a fallback for dev vs bundled.
+- [x] Port [history.py](medds_agent/history.py) → `src/history/`. Step union (`UserStep | AgentStep | ObservationStep | SystemStep`), `Round`, `History` class. JSON serialization round-trip tested.
+- [x] Port [database.py](medds_agent/database.py) → `src/db/`. Same SQLite schema. Wrap better-sqlite3. Test: create session, write/read history, write/read config.
+- [x] Port [engines.py](medds_agent/engines.py) → `src/engines/`. Implement `OpenAIEngine` (covers any OpenAI-compatible endpoint: OpenAI, vLLM, SGLang, OpenRouter, etc.) and `AzureOpenAIEngine`. Common interface with `chat(messages, tools)` returning `{ response, tool_calls }`. Tool-call argument normalization (LLMs sometimes return strings vs objects — match Python behavior).
+- [x] Port prompt template loader (current Python uses `importlib.resources`). TS equivalent: read from `prompts/` dir relative to package root, with a fallback for dev vs bundled.
 
 ### Phase 2 — Memory (the differentiator)
 
-- [ ] Port `AgentMemory` base class
-- [ ] Port `FullHistoryAgentMemory`
-- [ ] Port `SlidingWindowAgentMemory` (start_window_size + end_window_size)
-- [ ] Port `IndexedAgentMemory` — the LLM-compression strategy. Compression model: read from a separate optional config slot; if absent, fall back to the agent's main LLM engine.
-- [ ] Port `get_memory_debug` and `get_compression_debug` (the API exposes these).
-- [ ] Tests: known step sequences → expected `messages` arrays; compression triggers at the right thresholds.
+- [x] Port `AgentMemory` base class
+- [x] Port `FullHistoryAgentMemory`
+- [x] Port `SlidingWindowAgentMemory` (start_window_size + end_window_size)
+- [x] Port `IndexedAgentMemory` — the LLM-compression strategy. Compression model: read from a separate optional config slot; if absent, fall back to the agent's main LLM engine.
+- [x] Port `get_memory_debug` and `get_compression_debug` (the API exposes these).
+- [x] Tests: known step sequences → expected `messages` arrays; compression triggers at the right thresholds.
 
 ### Phase 3 — Agent loop
 
-- [ ] Port `JobManager` from [job_manager.py](medds_agent/job_manager.py) — job statuses (`COMPLETED | FAILED | TIMED_OUT | CANCELLED`), `submit`, `wait_async`, `cancel`, `has_pending`.
-- [ ] Port `Tool` and `AsyncTool` abstract classes.
-- [ ] Port `FinalResponseTool`, `JobWaitTool`, `JobCancelTool` (these are language-runtime-free, pure orchestration tools — auto-injected by the agent).
-- [ ] Port `Agent` class. Single async streaming generator (no sync variant). Yields events: `tool_running`, `tool_output`, `response`, `final_decision`. Implement Phase 1 dispatch + Phase 2 auto-wait pattern from [agents.py](medds_agent/agents.py:247-320). Auto-wait timeout from `MEDDS_AUTO_WAIT_TIMEOUT` env var (default 5s).
-- [ ] Reproduce all the round-validation rules: must always call a tool, `final_response` must be alone, cannot finalize while async job pending.
-- [ ] Tests with a mock engine that scripts tool-call sequences.
+- [x] Port `JobManager` from [job_manager.py](medds_agent/job_manager.py) — job statuses (`COMPLETED | FAILED | TIMED_OUT | CANCELLED`), `submit`, `wait_async`, `cancel`, `has_pending`.
+- [x] Port `Tool` and `AsyncTool` abstract classes.
+- [x] Port `FinalResponseTool`, `JobWaitTool`, `JobCancelTool` (these are language-runtime-free, pure orchestration tools — auto-injected by the agent).
+- [x] Port `Agent` class. Single async streaming generator (no sync variant). Yields events: `tool_running`, `tool_output`, `response`, `final_decision`. Implement Phase 1 dispatch + Phase 2 auto-wait pattern from [agents.py](medds_agent/agents.py:247-320). Auto-wait timeout from `MEDDS_AUTO_WAIT_TIMEOUT` env var (default 5s).
+- [x] Reproduce all the round-validation rules: must always call a tool, `final_response` must be alone, cannot finalize while async job pending.
+- [x] Tests with a mock engine that scripts tool-call sequences.
 
 ### Phase 4 — Tool runtime via subprocess (the decoupling payoff)
 
-- [ ] Port `WorkerHandler`-parent-side from [workers.py](medds_agent/workers.py) → `src/workers/WorkerProcess.ts`. Use `execa`. Implement: spawn, startup handshake, JSON-line read/write loop, command dispatch, cancellation, restart.
-- [ ] Implement `PythonExecutorTool` (TS class). It wraps a `WorkerProcess` running `python -m python_worker.entry python_worker.handlers.PythonHandler --work_dir ...`. Interpreter path comes from session config (`pythonPath`).
-- [ ] Implement `RExecutorTool` similarly (deferred until R worker added).
-- [ ] Implement `FileSystemTool` (sync, in-process — no subprocess needed).
-- [ ] Validate the Python worker still works unchanged after Phase 0 move. End-to-end test: TS parent spawns Python worker, sends `execute({code: "print(1+1)"})`, gets back `2`.
-- [ ] Add a no-tool config path: agent can be created with empty tool list (chat-only mode). Verify nothing requires Python on disk.
+- [x] Port `WorkerHandler`-parent-side from [workers.py](medds_agent/workers.py) → `src/workers/WorkerProcess.ts`. Use `execa`. Implement: spawn, startup handshake, JSON-line read/write loop, command dispatch, cancellation, restart.
+- [x] Implement `PythonExecutorTool` (TS class). It wraps a `WorkerProcess` running `python -m python_worker.entry python_worker.handlers.PythonHandler --work_dir ...`. Interpreter path comes from session config (`pythonPath`).
+- [x] Implement `RExecutorTool` similarly (deferred until R worker added).
+- [x] Implement `FileSystemTool` (sync, in-process — no subprocess needed).
+- [x] Validate the Python worker still works unchanged after Phase 0 move. End-to-end test: TS parent spawns Python worker, sends `execute({code: "print(1+1)"})`, gets back `2`.
+- [x] Add a no-tool config path: agent can be created with empty tool list (chat-only mode). Verify nothing requires Python on disk.
 - [ ] VS Code helper: read interpreter path from VS Code's Python extension settings (`python.defaultInterpreterPath`) when running in extension host.
 
 ### Phase 5 — REST API
 
-- [ ] Set up Fastify with TypeBox schemas.
-- [ ] Port endpoints from [server.py](medds_agent/server.py) one tag at a time, in this order: Health → Specialty → Sessions → Chat (SSE) → Memory → Variables → Files. Keep paths and request/response shapes identical.
-- [ ] SSE for `POST /sessions/{id}/chat`: stream the agent's generator events.
-- [ ] Multipart upload for `POST /sessions/{id}/files`.
-- [ ] CORS open (matches current `allow_origins=["*"]`).
+- [ ] Set up Fastify with TypeBox schemas. **Fastify is set up; TypeBox is not.** `@sinclair/typebox` is a declared dependency but is imported nowhere. Routes are typed with Fastify generics only, which are erased at runtime, so no request body is validated: a malformed body reaches the handler and surfaces as a 500 with the raw internal error message instead of a 400. Adding schemas touches every route and changes error response shapes, so weigh it against decision #7 (keep payloads identical to the Python server).
+- [x] Port endpoints from [server.py](medds_agent/server.py) one tag at a time, in this order: Health → Specialty → Sessions → Chat (SSE) → Memory → Variables → Files. Keep paths and request/response shapes identical.
+- [x] SSE for `POST /sessions/{id}/chat`: stream the agent's generator events.
+- [x] Multipart upload for `POST /sessions/{id}/files`.
+- [x] CORS open (matches current `allow_origins=["*"]`).
 - [ ] Smoke test against current MedDSAgent-App docker-compose by swapping the backend image.
 
 ### Phase 6 — Session manager
 
-- [ ] Port [manager.py](medds_agent/manager.py) → `src/session/SessionManager.ts`. Hot cache of `{ agent, worker, last_active, persisted_steps }`. Session create/delete/update. Agent instantiation from stored config. System-step injection on DB connection. Active-task tracking for cancellation.
-- [ ] Per-session work_dir (`workspace/sessions/{session_id}/{uploads,outputs,scripts,internal}`).
-- [ ] Persistence: agent state, history, memory, worker variable state (via the worker's `save_state`/`load_state` Python-side methods — already implemented).
+- [x] Port [manager.py](medds_agent/manager.py) → `src/session/SessionManager.ts`. Hot cache of `{ agent, worker, last_active, persisted_steps }`. Session create/delete/update. Agent instantiation from stored config. System-step injection on DB connection. Active-task tracking for cancellation.
+- [x] Per-session work_dir (`workspace/sessions/{session_id}/{uploads,outputs,scripts,internal}`).
+- [x] Persistence: agent state, history, memory, worker variable state (via the worker's `save_state`/`load_state` Python-side methods — already implemented).
 
 ### Phase 7 — VS Code in-process mode
 
-- [ ] Refactor entry points so the package exports both:
+- [x] Refactor entry points so the package exports both:
   - `startServer(opts)` — Fastify HTTP server
   - `createSessionManager(opts)` — direct library API for VS Code extension
-- [ ] Ensure no module-level side effects that assume HTTP context.
-- [ ] Document the in-process API in `docs/in-process-api.md` for the VS Code extension to consume.
+- [x] Ensure no module-level side effects that assume HTTP context.
+- [x] Document the in-process API in `docs/in-process-api.md` for the VS Code extension to consume.
 
 ### Phase 8 — CLI
 
-- [ ] Build a `commander`-based CLI: `meddsagent serve [--port]`, `meddsagent session list`, `meddsagent session new`, etc. — match current [cli.py](medds_agent/cli.py) surface.
-- [ ] Publishable as `npx meddsagent ...`.
+- [x] Build a `commander`-based CLI: `meddsagent serve [--port]`, `meddsagent session list`, `meddsagent session new`, etc. — match current [cli.py](medds_agent/cli.py) surface.
+- [x] Publishable as `npx meddsagent ...`.
 
 ### Phase 9 — Cutover
 
-- [ ] Update [Dockerfile](Dockerfile) to build the TS image (Node base, copy `dist/` and `python_worker/`, install Python only if user wants Python tools — make it an optional layer).
+- [x] Update [Dockerfile](Dockerfile) to build the TS image (Node base, copy `dist/` and `python_worker/`, install Python only if user wants Python tools — make it an optional layer).
 - [ ] Update [MedDSAgent-App](https://github.com/MedDSAgent/MedDSAgent-App) docker-compose to point at the new image.
 - [ ] Update [MedDSAgent-VSCode](https://github.com/MedDSAgent/MedDSAgent-VSCode) extension to consume the in-process library.
-- [ ] Final commit: delete `medds_agent/` Python sources (history is preserved in git). Update root [README.md](README.md) to reflect the new architecture. Add a "Legacy Python implementation" note pointing readers to the last commit on the Python branch (tag it `python-final` before deletion).
-- [ ] `pyproject.toml`, `medds_agent.egg-info/`, `build/` — remove.
+- [x] Final commit: delete `medds_agent/` Python sources (history is preserved in git). Update root [README.md](README.md) to reflect the new architecture. Add a "Legacy Python implementation" note pointing readers to the last commit on the Python branch (tag it `python-final` before deletion).
+- [x] `pyproject.toml`, `medds_agent.egg-info/`, `build/` — remove.
 
 ---
 
@@ -199,9 +208,29 @@ Each phase ends with a working, tested checkpoint. Do not skip ahead — later p
 
 ## 9. Definition of done
 
-- All current REST endpoints respond with the same payloads from the TS server
-- A session can be created, chat works end-to-end, Python tool execution works via the (unchanged) Python worker subprocess
-- The agent runs without Python installed if no Python-using tools are configured
-- VS Code extension can `import` the package and run an agent without spawning a sidecar HTTP server
-- Docker App works against the new image with no client changes
-- Python sources are removed from `main`; final Python state is preserved at tag `python-final`
+- [x] All current REST endpoints respond with the same payloads from the TS server
+- [x] A session can be created, chat works end-to-end, Python tool execution works via the (unchanged) Python worker subprocess
+- [x] The agent runs without Python installed if no Python-using tools are configured
+- [ ] VS Code extension can `import` the package and run an agent without spawning a sidecar HTTP server — the library API exists and is documented; the extension has not been switched over yet
+- [ ] Docker App works against the new image with no client changes — the image builds, boots, and serves `/health` with a working Python worker, but it has not been run against the App's docker-compose
+- [x] Python sources are removed from `main`; final Python state is preserved at tag `python-final`
+
+---
+
+## 10. What's left
+
+Everything else in this document is done. These five are not:
+
+| # | Item | Where | Notes |
+|---|------|-------|-------|
+| 1 | TypeBox request validation | this repo, §Phase 5 | `@sinclair/typebox` is a dependency imported nowhere. Routes use Fastify generics, which are erased at runtime, so no body is validated — malformed input returns a 500 with the raw internal error instead of a 400. Touches every route and changes error shapes; weigh against decision #7. |
+| 2 | VS Code interpreter helper | this repo, §Phase 4 | Read `python.defaultInterpreterPath` from the Python extension when running in the extension host. Today `pythonPath` must be supplied via session config. |
+| 3 | App docker-compose | MedDSAgent-App | Point at the new Node image. **Must pin Node ≥ 24** — see the `node:sqlite` note in §4. |
+| 4 | App smoke test | MedDSAgent-App | Swap the backend image in docker-compose and verify no client changes are needed. Blocked on #3. |
+| 5 | VSCode extension cutover | MedDSAgent-VSCode | Consume `createSessionManager()` in-process instead of spawning an HTTP sidecar. See [docs/in-process-api.md](docs/in-process-api.md). |
+
+### Known gaps not tracked above
+
+- **`node:sqlite` prints an ExperimentalWarning on every start** (Node 24). Harmless and unavoidable short of suppressing warnings globally, but it is noise in CLI output and container logs.
+- **R is implemented but not installable.** `RExecutorTool`, `RHandler` (rpy2-based, in `python_worker/handlers.py`), and the `language: "r"` path through `SessionManager` all exist. But `RHandler` declares `REQUIRED_DEPS = ["rpy2"]` and rpy2 is absent from `python_worker/requirements.txt`, and the Docker image installs neither R nor rpy2. So `language: "r"` raises ImportError at worker startup on a stock install. Either add rpy2 + an R runtime to the image, or document R as a bring-your-own-environment feature. (Note the §3 plan assumed R would land as a separate `r_worker/`; it did not — it shares `python_worker`, since rpy2 is a Python binding.)
+- **Docling RAG / DocumentSearch remains deferred.** `DocumentIndexerHandler` was deleted during the Phase 9 cutover rather than left importing deleted `medds_agent` modules; recover it from `python-final` when it is re-added as its own subprocess worker.
