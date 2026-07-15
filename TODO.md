@@ -155,7 +155,7 @@ Each phase ends with a working, tested checkpoint. Do not skip ahead — later p
 
 - [x] Port `WorkerHandler`-parent-side from [workers.py](medds_agent/workers.py) → `src/workers/WorkerProcess.ts`. Use `execa`. Implement: spawn, startup handshake, JSON-line read/write loop, command dispatch, cancellation, restart.
 - [x] Implement `PythonExecutorTool` (TS class). It wraps a `WorkerProcess` running `python -m python_worker.entry python_worker.handlers.PythonHandler --work_dir ...`. Interpreter path comes from session config (`pythonPath`).
-- [x] Implement `RExecutorTool` similarly (deferred until R worker added).
+- [x] Implement `RExecutorTool` similarly (deferred until R worker added). **The `r_worker/` now exists**: native R via `Rscript r_worker/entry.R`, no rpy2. `WorkerProcess` takes a `WorkerSpec` (command + args) instead of assuming Python, so the parent side is now as language-agnostic as the protocol always claimed to be.
 - [x] Implement `FileSystemTool` (sync, in-process — no subprocess needed).
 - [x] Validate the Python worker still works unchanged after Phase 0 move. End-to-end test: TS parent spawns Python worker, sends `execute({code: "print(1+1)"})`, gets back `2`.
 - [x] Add a no-tool config path: agent can be created with empty tool list (chat-only mode). Verify nothing requires Python on disk.
@@ -168,7 +168,7 @@ Each phase ends with a working, tested checkpoint. Do not skip ahead — later p
 - [x] SSE for `POST /sessions/{id}/chat`: stream the agent's generator events.
 - [x] Multipart upload for `POST /sessions/{id}/files`.
 - [x] CORS open (matches current `allow_origins=["*"]`).
-- [ ] Smoke test against current MedDSAgent-App docker-compose by swapping the backend image.
+- [x] Smoke test against current MedDSAgent-App docker-compose by swapping the backend image. **Done — passed with zero App changes**, confirming decision #7. No image swap was needed: the compose file builds `backend` from `context: ../MedDSAgent-Core`, so it picks up the new Dockerfile directly. Verified through the App's reverse proxy: `/health`, `/specialty-prompts`, `POST /sessions`, `/sessions/{id}/variables` (live Python worker with pandas), `/sessions/{id}/history`, `DELETE /sessions/{id}`. Backend reached HEALTHCHECK `healthy`; no errors in either service's logs.
 
 ### Phase 6 — Session manager
 
@@ -192,7 +192,7 @@ Each phase ends with a working, tested checkpoint. Do not skip ahead — later p
 ### Phase 9 — Cutover
 
 - [x] Update [Dockerfile](Dockerfile) to build the TS image (Node base, copy `dist/` and `python_worker/`, install Python only if user wants Python tools — make it an optional layer).
-- [ ] Update [MedDSAgent-App](https://github.com/MedDSAgent/MedDSAgent-App) docker-compose to point at the new image.
+- [x] Update [MedDSAgent-App](https://github.com/MedDSAgent/MedDSAgent-App) docker-compose to point at the new image. **No change was needed** — `docker-compose.yml` builds `backend` from `context: ../MedDSAgent-Core`, so it picks up the new Dockerfile directly. Verified end-to-end (see the Phase 5 smoke-test note). Note `docker-compose.hub.yml` still pulls the *old published* `daviden1013/meddsagent-backend:latest`; that image needs rebuilding and pushing before the hub compose serves the TS backend.
 - [ ] Update [MedDSAgent-VSCode](https://github.com/MedDSAgent/MedDSAgent-VSCode) extension to consume the in-process library.
 - [x] Final commit: delete `medds_agent/` Python sources (history is preserved in git). Update root [README.md](README.md) to reflect the new architecture. Add a "Legacy Python implementation" note pointing readers to the last commit on the Python branch (tag it `python-final` before deletion).
 - [x] `pyproject.toml`, `medds_agent.egg-info/`, `build/` — remove.
@@ -225,12 +225,11 @@ Everything else in this document is done. These five are not:
 |---|------|-------|-------|
 | 1 | TypeBox request validation | this repo, §Phase 5 | `@sinclair/typebox` is a dependency imported nowhere. Routes use Fastify generics, which are erased at runtime, so no body is validated — malformed input returns a 500 with the raw internal error instead of a 400. Touches every route and changes error shapes; weigh against decision #7. |
 | 2 | VS Code interpreter helper | this repo, §Phase 4 | Read `python.defaultInterpreterPath` from the Python extension when running in the extension host. Today `pythonPath` must be supplied via session config. |
-| 3 | App docker-compose | MedDSAgent-App | Point at the new Node image. **Must pin Node ≥ 24** — see the `node:sqlite` note in §4. |
-| 4 | App smoke test | MedDSAgent-App | Swap the backend image in docker-compose and verify no client changes are needed. Blocked on #3. |
-| 5 | VSCode extension cutover | MedDSAgent-VSCode | Consume `createSessionManager()` in-process instead of spawning an HTTP sidecar. See [docs/in-process-api.md](docs/in-process-api.md). |
+| 3 | R in the Docker image | this repo | The image installs Node + Python but no R, so `language: "r"` fails there (it works fine on a local install with `Rscript` on PATH). Decide: ship `r-base` + `jsonlite` (+ `ggplot2` for plot previews) and accept the size, or keep R bring-your-own and document the image as Python-only. The image is already 1.41GB. |
+| 4 | VSCode extension cutover | MedDSAgent-VSCode | Consume `createSessionManager()` in-process instead of spawning an HTTP sidecar. See [docs/in-process-api.md](docs/in-process-api.md). |
 
 ### Known gaps not tracked above
 
 - **`node:sqlite` prints an ExperimentalWarning on every start** (Node 24). Harmless and unavoidable short of suppressing warnings globally, but it is noise in CLI output and container logs.
-- **R is implemented but not installable.** `RExecutorTool`, `RHandler` (rpy2-based, in `python_worker/handlers.py`), and the `language: "r"` path through `SessionManager` all exist. But `RHandler` declares `REQUIRED_DEPS = ["rpy2"]` and rpy2 is absent from `python_worker/requirements.txt`, and the Docker image installs neither R nor rpy2. So `language: "r"` raises ImportError at worker startup on a stock install. Either add rpy2 + an R runtime to the image, or document R as a bring-your-own-environment feature. (Note the §3 plan assumed R would land as a separate `r_worker/`; it did not — it shares `python_worker`, since rpy2 is a Python binding.)
+- ~~**R is implemented but not installable** (rpy2 missing).~~ **Resolved.** The rpy2 dependency is gone: R now has a native worker in `r_worker/` (`Rscript r_worker/entry.R`), and the rpy2-based `RHandler` has been deleted from `python_worker/`. An R session spawns only an `R` process — no Python in the tree. This is what §3 originally intended. R users need R + the `jsonlite` package; see [r_worker/README.md](r_worker/README.md). **The Docker image still ships no R** — see §10 item 3.
 - **Docling RAG / DocumentSearch remains deferred.** `DocumentIndexerHandler` was deleted during the Phase 9 cutover rather than left importing deleted `medds_agent` modules; recover it from `python-final` when it is re-added as its own subprocess worker.

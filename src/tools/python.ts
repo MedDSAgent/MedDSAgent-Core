@@ -85,9 +85,13 @@ export class RExecutorTool extends AsyncTool {
     const rVersion =
       typeof readyInfo["r_version"] === "string" ? readyInfo["r_version"] : "R";
 
-    const availablePackages = Array.isArray(readyInfo["available_packages"])
-      ? (readyInfo["available_packages"] as string[]).join(", ")
-      : "base packages";
+    // Key must match what r_worker/entry.R sends in its ready_info — and what
+    // PythonExecutorTool reads. This previously looked for "available_packages",
+    // which no worker has ever sent, so it always fell back to "base packages".
+    const availablePackages =
+      Array.isArray(readyInfo["available_libs"]) && readyInfo["available_libs"].length > 0
+        ? (readyInfo["available_libs"] as string[]).join(", ")
+        : "base packages";
 
     const description =
       `Executes ${rVersion} code with full permissions. ` +

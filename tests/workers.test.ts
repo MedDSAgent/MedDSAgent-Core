@@ -3,7 +3,7 @@ import { spawnSync } from "child_process";
 import * as os from "os";
 import * as path from "path";
 import * as fs from "fs";
-import { WorkerProcess, WorkerStartupError } from "../src/workers/WorkerProcess.js";
+import { WorkerProcess, WorkerStartupError, pythonWorkerSpec } from "../src/workers/WorkerProcess.js";
 
 // ---------------------------------------------------------------------------
 // Find the Python binary from the conda 'agent' environment (or system python3).
@@ -41,8 +41,7 @@ describe.skipIf(!PYTHON_BIN)("WorkerProcess E2E", () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "medds-test-"));
     try {
       const wp = await WorkerProcess.create({
-        handlerClassPath: "python_worker.handlers.PythonHandler",
-        pythonBin: PYTHON_BIN!,
+        spec: pythonWorkerSpec("python_worker.handlers.PythonHandler", PYTHON_BIN!),
         handlerKwargs: { work_dir: tmpDir },
         cwd: PROJECT_ROOT,
       });
@@ -59,8 +58,7 @@ describe.skipIf(!PYTHON_BIN)("WorkerProcess E2E", () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "medds-test-"));
     try {
       const wp = await WorkerProcess.create({
-        handlerClassPath: "python_worker.handlers.PythonHandler",
-        pythonBin: PYTHON_BIN!,
+        spec: pythonWorkerSpec("python_worker.handlers.PythonHandler", PYTHON_BIN!),
         handlerKwargs: { work_dir: tmpDir },
         cwd: PROJECT_ROOT,
       });
@@ -78,8 +76,7 @@ describe.skipIf(!PYTHON_BIN)("WorkerProcess E2E", () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "medds-test-"));
     try {
       const wp = await WorkerProcess.create({
-        handlerClassPath: "python_worker.handlers.PythonHandler",
-        pythonBin: PYTHON_BIN!,
+        spec: pythonWorkerSpec("python_worker.handlers.PythonHandler", PYTHON_BIN!),
         handlerKwargs: { work_dir: tmpDir },
         cwd: PROJECT_ROOT,
       });
@@ -98,8 +95,7 @@ describe.skipIf(!PYTHON_BIN)("WorkerProcess E2E", () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "medds-test-"));
     try {
       const wp = await WorkerProcess.create({
-        handlerClassPath: "python_worker.handlers.PythonHandler",
-        pythonBin: PYTHON_BIN!,
+        spec: pythonWorkerSpec("python_worker.handlers.PythonHandler", PYTHON_BIN!),
         handlerKwargs: { work_dir: tmpDir },
         cwd: PROJECT_ROOT,
       });
@@ -122,8 +118,7 @@ describe.skipIf(!PYTHON_BIN)("WorkerProcess E2E", () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "medds-test-"));
     try {
       const wp = await WorkerProcess.create({
-        handlerClassPath: "python_worker.handlers.PythonHandler",
-        pythonBin: PYTHON_BIN!,
+        spec: pythonWorkerSpec("python_worker.handlers.PythonHandler", PYTHON_BIN!),
         handlerKwargs: { work_dir: tmpDir },
         cwd: PROJECT_ROOT,
       });
@@ -139,8 +134,7 @@ describe.skipIf(!PYTHON_BIN)("WorkerProcess E2E", () => {
   it("throws WorkerStartupError for a bad handler class path", async () => {
     await expect(
       WorkerProcess.create({
-        handlerClassPath: "python_worker.handlers.NonExistentHandler",
-        pythonBin: PYTHON_BIN!,
+        spec: pythonWorkerSpec("python_worker.handlers.NonExistentHandler", PYTHON_BIN!),
         cwd: PROJECT_ROOT,
       }),
     ).rejects.toThrow(WorkerStartupError);

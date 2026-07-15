@@ -19,11 +19,14 @@ installs none at all. Python is not required to run the agent.
                 │ (docs/worker-protocol.md)
     ┌───────────┴────────────┐
     │                        │
-┌───▼──────────┐   ┌─────────▼────┐
+┌──────────────┐   ┌──────────────┐
 │ python_worker│   │ r_worker     │
-│ (PythonHandler)  │ (RHandler)   │
+│ python -m …  │   │ Rscript …    │
 └──────────────┘   └──────────────┘
 ```
+
+Each worker is native to its own language: the R worker is plain R, so R users
+need no Python, and Python users need no R.
 
 The same codebase serves three targets:
 
@@ -40,6 +43,9 @@ The same codebase serves three targets:
   build toolchain needed.
 - **Python** only if you use the Python executor tool. Install
   `python_worker/requirements.txt` into whichever interpreter you point the agent at.
+- **R** only if you use the R executor tool: R with the `jsonlite` package, and
+  `Rscript` on `PATH` (or set `MEDDS_RSCRIPT_BIN`). See
+  [r_worker/README.md](r_worker/README.md).
 
 ## Quick start
 

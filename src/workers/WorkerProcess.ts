@@ -24,11 +24,31 @@ export class WorkerDeadError extends Error {
 // Config
 // ---------------------------------------------------------------------------
 
+/**
+ * How to launch a worker. The IPC contract (docs/worker-protocol.md) is
+ * language-agnostic, so this describes the command only — nothing here assumes
+ * Python. See pythonWorkerSpec() / rWorkerSpec() for the concrete launchers.
+ */
+export interface WorkerSpec {
+  /** Executable to spawn, e.g. "python" or "Rscript". */
+  command: string;
+  /** Fixed args preceding the --key value handler kwargs. */
+  args: string[];
+}
+
+/** Launch spec for a handler in the Python worker (python_worker/). */
+export function pythonWorkerSpec(handlerClassPath: string, pythonBin = "python"): WorkerSpec {
+  return { command: pythonBin, args: ["-m", "python_worker.entry", handlerClassPath] };
+}
+
+/** Launch spec for the R worker (r_worker/). `entryPath` is r_worker/entry.R. */
+export function rWorkerSpec(entryPath: string, rscriptBin = "Rscript"): WorkerSpec {
+  return { command: rscriptBin, args: [entryPath] };
+}
+
 export interface WorkerProcessConfig {
-  /** Dotted Python class path, e.g. "python_worker.handlers.PythonHandler" */
-  handlerClassPath: string;
-  /** Python interpreter. Defaults to "python". */
-  pythonBin?: string;
+  /** How to launch the worker. */
+  spec: WorkerSpec;
   /** Key-value pairs forwarded as --key value CLI args to the handler. */
   handlerKwargs?: Record<string, string>;
   /** Extra env vars merged on top of process.env. */
@@ -139,19 +159,19 @@ export class WorkerProcess {
   // ------------------------------------------------------------------
 
   private _buildArgs(): [string, string[]] {
-    const python = this.config.pythonBin ?? "python";
-    const args = ["-m", "python_worker.entry", this.config.handlerClassPath];
+    const { command, args: specArgs } = this.config.spec;
+    const args = [...specArgs];
     for (const [k, v] of Object.entries(this.config.handlerKwargs ?? {})) {
       args.push(`--${k}`, v);
     }
-    return [python, args];
+    return [command, args];
   }
 
   private async _start(): Promise<void> {
-    const [python, args] = this._buildArgs();
+    const [command, args] = this._buildArgs();
     const env = this.config.env ? { ...process.env, ...this.config.env } : undefined;
 
-    this.child = spawn(python, args, {
+    this.child = spawn(command, args, {
       stdio: ["pipe", "pipe", "pipe"],
       env,
       cwd: this.config.cwd ?? process.cwd(),

@@ -44,6 +44,14 @@ COPY python_worker/ ./python_worker/
 RUN pip3 install --no-cache-dir --break-system-packages \
         -r python_worker/requirements.txt
 
+# R worker source. NOTE: this image does not install R, so `language: "r"` will
+# fail here with "Rscript not found". The source ships anyway (it is a few KB) so
+# that an image derived from this one only needs to add R + the jsonlite package:
+#   FROM <this image>
+#   RUN apt-get update && apt-get install -y r-base \
+#    && Rscript -e 'install.packages("jsonlite", repos="https://cloud.r-project.org")'
+COPY r_worker/ ./r_worker/
+
 # Workspace volume — mount a host directory here at runtime
 RUN mkdir -p /workspace
 VOLUME /workspace

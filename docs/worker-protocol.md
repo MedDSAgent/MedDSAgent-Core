@@ -2,7 +2,7 @@
 
 This document specifies the JSON-line protocol used between the TypeScript agent
 (parent process, `src/workers/`) and language-runtime worker subprocesses
-(`python_worker/`, and future `r_worker/`, `bash_worker/`).
+(`python_worker/`, `r_worker/`, and a future `bash_worker/`).
 
 Any language can implement a compliant worker as long as it follows this contract.
 
@@ -85,10 +85,13 @@ The parent spawns the worker and reads exactly **one line** before sending any c
 
 ### `ready_info` payload (R worker)
 
+Spawned as `Rscript r_worker/entry.R --work_dir /path/to/session`. Note there is no
+`python_version`: the R worker is native R and no Python is involved.
+
 ```json
 {
-  "r_version": "R version 4.4.0 (2024-04-24)",
-  "python_version": "3.12.5"
+  "r_version": "R version 4.5.2 (2025-10-31)",
+  "available_libs": ["ggplot2", "dplyr", "tidyr", "data.table", "survival"]
 }
 ```
 
@@ -224,16 +227,25 @@ Clear all user variables and re-run environment setup.
 
 ---
 
-### RHandler (`python_worker.handlers.RHandler`)
+### R worker (`r_worker/entry.R`)
 
-Implements the same method set as PythonHandler (`execute`, `inject`, `get_state`,
-`save_state`, `load_state`, `reset_state`) with the same request/response shapes.
-Differences:
+Native R — no Python, no rpy2. Implements the same method set as PythonHandler
+(`execute`, `inject`, `get_state`, `save_state`, `load_state`, `reset_state`) with
+the same request/response shapes. Differences:
 
-- `execute` runs R code via `rpy2`; result display uses `capture.output(print(...))`.
-- `save_state`/`load_state` use R's native `.RData` format (`save()`/`load()`).
-- `get_state` inspects the rpy2 `Environment` object and maps R types to the
-  same `{name, type, value, preview, is_error}` structure.
+- `execute` evaluates each top-level expression in a dedicated environment and mimics
+  the REPL: visible results autoprint via `print()`, `invisible()` results produce no
+  output. Warnings are collected and appended under `[stderr]`; errors stop evaluation
+  and are appended under `[Error]`.
+- `save_state`/`load_state` use R's native `.RData` format (`save()`/`load()`) — the
+  same format the previous rpy2-based handler wrote, so old state still loads.
+- `get_state` walks the environment and maps R types to the same
+  `{name, type, value, preview, is_error}` structure. `data.frame` previews are HTML
+  tables (`class="dataframe df-table"`, cells HTML-escaped) matching what pandas'
+  `to_html` produced on the Python side; `ggplot` objects render to a base64 PNG
+  `<img>` tag.
+- Requires the `jsonlite` R package. `ggplot2` is optional and only affects plot
+  previews. See [../r_worker/README.md](../r_worker/README.md).
 
 ---
 

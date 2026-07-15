@@ -23,8 +23,27 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: "npm"
 
+      # R is required by tests/rworker.test.ts. Without it those tests skip
+      # silently, so install it here and assert it below rather than let the
+      # suite go green on a partial run.
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "release"
+
+      - name: Install R worker dependencies
+        run: Rscript -e 'install.packages("jsonlite", repos = "https://cloud.r-project.org")'
+
+      - name: Verify R toolchain is usable
+        run: |
+          Rscript --version
+          Rscript -e 'stopifnot(requireNamespace("jsonlite", quietly = TRUE)); cat("jsonlite OK\n")'
+
       - name: Install dependencies
         run: npm ci
+
+      - name: Lint
+        run: npm run lint
 
       - name: Type-check
         run: npm run typecheck

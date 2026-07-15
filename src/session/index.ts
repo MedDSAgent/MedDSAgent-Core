@@ -3,7 +3,7 @@ import * as path from "path";
 import { randomUUID } from "crypto";
 import { fileURLToPath } from "url";
 
-// Root of the MedDSAgent-Core package — python_worker/ lives here.
+// Root of the MedDSAgent-Core package — python_worker/ and r_worker/ live here.
 // dist/session/index.js → dist/ → core root (two levels up)
 const _CORE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 import { InternalDatabase } from "../db/index.js";
@@ -14,7 +14,7 @@ import { makeHistory, makeSystemStep, addStep } from "../history/index.js";
 import type { HistoryData, Step } from "../history/index.js";
 import { createEngine } from "../engines/index.js";
 import type { LLMEngine } from "../engines/index.js";
-import { WorkerProcess } from "../workers/WorkerProcess.js";
+import { WorkerProcess, pythonWorkerSpec, rWorkerSpec } from "../workers/WorkerProcess.js";
 import { JobManager } from "../jobs/index.js";
 import { PythonExecutorTool, RExecutorTool } from "../tools/python.js";
 import { FileSystemTool } from "../tools/filesystem.js";
@@ -355,24 +355,34 @@ export class SessionManager implements ISessionManager {
     config: SessionConfig,
   ): Promise<CacheEntry> {
     const language = ((config.language as string | undefined) ?? "python").toLowerCase();
-    const pythonBin =
-      (config.python_bin as string | undefined) ??
-      process.env["MEDDS_PYTHON_BIN"] ??
-      "python";
-
+    // Each language runs in its own worker with its own runtime. R goes through
+    // r_worker/ (native Rscript) and never touches Python; a Python install is
+    // only needed when the Python executor is actually selected.
     const workerEnv: Record<string, string> = {};
-    const rHome = (config.r_home as string | undefined) ?? process.env["MEDDS_R_HOME"];
-    if (rHome) workerEnv["R_HOME"] = rHome;
-    // Ensure python_worker/ is importable regardless of the server's cwd.
-    const existingPythonPath = process.env["PYTHONPATH"] ?? "";
-    workerEnv["PYTHONPATH"] = existingPythonPath ? `${_CORE_ROOT}:${existingPythonPath}` : _CORE_ROOT;
+    let spec;
 
-    const handlerClassPath =
-      language === "r"
-        ? "python_worker.handlers.RHandler"
-        : "python_worker.handlers.PythonHandler";
+    if (language === "r") {
+      const rscriptBin =
+        (config.rscript_bin as string | undefined) ??
+        process.env["MEDDS_RSCRIPT_BIN"] ??
+        "Rscript";
+      const rHome = (config.r_home as string | undefined) ?? process.env["MEDDS_R_HOME"];
+      if (rHome) workerEnv["R_HOME"] = rHome;
+      spec = rWorkerSpec(path.join(_CORE_ROOT, "r_worker", "entry.R"), rscriptBin);
+    } else {
+      const pythonBin =
+        (config.python_bin as string | undefined) ??
+        process.env["MEDDS_PYTHON_BIN"] ??
+        "python";
+      // Ensure python_worker/ is importable regardless of the server's cwd.
+      const existingPythonPath = process.env["PYTHONPATH"] ?? "";
+      workerEnv["PYTHONPATH"] = existingPythonPath
+        ? `${_CORE_ROOT}:${existingPythonPath}`
+        : _CORE_ROOT;
+      spec = pythonWorkerSpec("python_worker.handlers.PythonHandler", pythonBin);
+    }
 
-    const workerConfig = { handlerClassPath, pythonBin, handlerKwargs: { work_dir: sessionDir }, env: workerEnv };
+    const workerConfig = { spec, handlerKwargs: { work_dir: sessionDir }, env: workerEnv };
     const worker = await WorkerProcess.create(workerConfig);
 
     const jobManager = new JobManager(worker);
