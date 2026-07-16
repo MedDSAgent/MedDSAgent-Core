@@ -3,9 +3,9 @@
 This document is the implementation brief for porting MedDSAgent-Core from Python to TypeScript. It is self-contained: an agent picking this up should not need any prior conversation context.
 
 > **Status: the rewrite is complete and the Python sources have been removed from `main`.**
-> Everything below is ticked except the five items listed in §10, which are the only
+> Everything below is ticked except the three items listed in §10, which are the only
 > outstanding work. Sections 1–6 are kept as the historical record of why the port was
-> built the way it was.
+> built the way it was; §11 describes what the Docker image ships and why.
 >
 > **All `medds_agent/…` paths in this document are dead links on `main`.** The Python
 > tree they refer to is preserved at the **`python-final`** tag; read them there, e.g.
@@ -191,7 +191,7 @@ Each phase ends with a working, tested checkpoint. Do not skip ahead — later p
 
 ### Phase 9 — Cutover
 
-- [x] Update [Dockerfile](Dockerfile) to build the TS image (Node base, copy `dist/` and `python_worker/`, install Python only if user wants Python tools — make it an optional layer).
+- [x] Update [Dockerfile](Dockerfile) to build the TS image (Node base, copy `dist/` and `python_worker/`, install Python only if user wants Python tools — make it an optional layer). **Python was not made optional, and the image now ships R too** — see §11. Making the language runtimes optional layers is still possible via build args if image size becomes a problem; it did not, because removing the unused compiler paid for R twice over.
 - [x] Update [MedDSAgent-App](https://github.com/MedDSAgent/MedDSAgent-App) docker-compose to point at the new image. **No change was needed** — `docker-compose.yml` builds `backend` from `context: ../MedDSAgent-Core`, so it picks up the new Dockerfile directly. Verified end-to-end (see the Phase 5 smoke-test note). Note `docker-compose.hub.yml` still pulls the *old published* `daviden1013/meddsagent-backend:latest`; that image needs rebuilding and pushing before the hub compose serves the TS backend.
 - [ ] Update [MedDSAgent-VSCode](https://github.com/MedDSAgent/MedDSAgent-VSCode) extension to consume the in-process library.
 - [x] Final commit: delete `medds_agent/` Python sources (history is preserved in git). Update root [README.md](README.md) to reflect the new architecture. Add a "Legacy Python implementation" note pointing readers to the last commit on the Python branch (tag it `python-final` before deletion).
@@ -212,7 +212,7 @@ Each phase ends with a working, tested checkpoint. Do not skip ahead — later p
 - [x] A session can be created, chat works end-to-end, Python tool execution works via the (unchanged) Python worker subprocess
 - [x] The agent runs without Python installed if no Python-using tools are configured
 - [ ] VS Code extension can `import` the package and run an agent without spawning a sidecar HTTP server — the library API exists and is documented; the extension has not been switched over yet
-- [ ] Docker App works against the new image with no client changes — the image builds, boots, and serves `/health` with a working Python worker, but it has not been run against the App's docker-compose
+- [x] Docker App works against the new image with no client changes — **confirmed**. The App's docker-compose was brought up against the TS backend with zero App changes: sessions written by the old Python backend load (history, `.RData`/`state.pkl` state, and configs using the dropped `vllm` provider name), and chat, file upload, and a real analysis were exercised by hand.
 - [x] Python sources are removed from `main`; final Python state is preserved at tag `python-final`
 
 ---
@@ -225,11 +225,60 @@ Everything else in this document is done. These five are not:
 |---|------|-------|-------|
 | 1 | TypeBox request validation | this repo, §Phase 5 | `@sinclair/typebox` is a dependency imported nowhere. Routes use Fastify generics, which are erased at runtime, so no body is validated — malformed input returns a 500 with the raw internal error instead of a 400. Touches every route and changes error shapes; weigh against decision #7. |
 | 2 | VS Code interpreter helper | this repo, §Phase 4 | Read `python.defaultInterpreterPath` from the Python extension when running in the extension host. Today `pythonPath` must be supplied via session config. |
-| 3 | R in the Docker image | this repo | The image installs Node + Python but no R, so `language: "r"` fails there (it works fine on a local install with `Rscript` on PATH). Decide: ship `r-base` + `jsonlite` (+ `ggplot2` for plot previews) and accept the size, or keep R bring-your-own and document the image as Python-only. The image is already 1.41GB. |
-| 4 | VSCode extension cutover | MedDSAgent-VSCode | Consume `createSessionManager()` in-process instead of spawning an HTTP sidecar. See [docs/in-process-api.md](docs/in-process-api.md). |
+| 3 | VSCode extension cutover | MedDSAgent-VSCode | Consume `createSessionManager()` in-process instead of spawning an HTTP sidecar. See [docs/in-process-api.md](docs/in-process-api.md). |
 
 ### Known gaps not tracked above
 
 - **`node:sqlite` prints an ExperimentalWarning on every start** (Node 24). Harmless and unavoidable short of suppressing warnings globally, but it is noise in CLI output and container logs.
-- ~~**R is implemented but not installable** (rpy2 missing).~~ **Resolved.** The rpy2 dependency is gone: R now has a native worker in `r_worker/` (`Rscript r_worker/entry.R`), and the rpy2-based `RHandler` has been deleted from `python_worker/`. An R session spawns only an `R` process — no Python in the tree. This is what §3 originally intended. R users need R + the `jsonlite` package; see [r_worker/README.md](r_worker/README.md). **The Docker image still ships no R** — see §10 item 3.
+- ~~**R is implemented but not installable** (rpy2 missing).~~ **Resolved.** The rpy2 dependency is gone: R now has a native worker in `r_worker/` (`Rscript r_worker/entry.R`), and the rpy2-based `RHandler` has been deleted from `python_worker/`. An R session spawns only an `R` process — no Python in the tree. This is what §3 originally intended. The Docker image now ships R 4.6 + jsonlite/ggplot2/dplyr/tidyr/data.table/survival alongside the full Python stack; for local installs see [r_worker/README.md](r_worker/README.md).
 - **Docling RAG / DocumentSearch remains deferred.** `DocumentIndexerHandler` was deleted during the Phase 9 cutover rather than left importing deleted `medds_agent` modules; recover it from `python-final` when it is re-added as its own subprocess worker.
+
+---
+
+## 11. Docker image composition
+
+The image ships **both** language runtimes; `language: "python"` and `language: "r"`
+both work with no extra setup.
+
+| | Version | Source |
+|---|---|---|
+| Node | 24 | `node:24-slim` base (needs ≥24 for `node:sqlite`, see §4) |
+| Python | 3.11 | Debian `python3` + wheels from `python_worker/requirements.txt` |
+| R | 4.6 | CRAN's Debian repo (`bookworm-cran46`) — Debian's own R is 4.2.2 |
+| R packages | — | Posit Package Manager binaries + `r-recommended` from apt |
+
+### There is deliberately no compiler in the image
+
+Every Python and R dependency installs from a prebuilt binary, and both installs are
+pinned binary-only (`pip --only-binary=:all:`; P3M's `HTTPUserAgent` binary path for R).
+If a dependency ever stops shipping a binary the build **fails loudly** instead of
+silently reintroducing the toolchain.
+
+This matters more than it sounds. The runtime stage used to install `build-essential`
++ `python3-dev` — a leftover from `better-sqlite3`, which needed a compiler for its
+native addon. Once the DB layer moved to the built-in `node:sqlite` nothing needed it,
+but it kept shipping: **~330MB of gcc/g++/cpp in production for no reason.**
+
+Measured, each variant built and run:
+
+| Image | Size |
+|---|---|
+| Old published Python backend (`daviden1013/meddsagent-backend`) | 2.8 GB |
+| TS image with the leftover toolchain (Python only, no R) | 1.41 GB |
+| Toolchain removed (Python only, no R) | 1.08 GB |
+| **Toolchain removed + full R** ← current | **1.30 GB** |
+
+So shipping R costs ~220MB and the result is still smaller than the Python-only image
+that preceded it. Removing the dead compiler paid for R twice over.
+
+### Gotchas
+
+- **`survival` has no P3M binary.** It is one of R's *recommended* packages, which
+  `r-base-core` omits. `install.packages("survival")` therefore falls back to a source
+  build and fails without a compiler. It comes from `r-recommended` via apt instead,
+  built against this exact R version. The same will apply to any other recommended
+  package (`Matrix`, `lattice`, `boot`, `nlme`, …).
+- **The CRAN apt suite is version-pinned** (`bookworm-cran46`). It will need bumping for
+  future R releases; there is no rolling "latest" suite.
+- **P3M's binaries depend on the `HTTPUserAgent` option.** Without it the same URL serves
+  source tarballs and every package compiles. Do not remove that line.

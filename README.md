@@ -47,6 +47,9 @@ The same codebase serves three targets:
   `Rscript` on `PATH` (or set `MEDDS_RSCRIPT_BIN`). See
   [r_worker/README.md](r_worker/README.md).
 
+Neither is needed for chat-only use, and neither is needed to use the other.
+The Docker image ships both (see below), so this only applies to local installs.
+
 ## Quick start
 
 ```bash
@@ -56,6 +59,27 @@ node dist/cli/index.js serve --work-dir ./workspace --port 7842
 ```
 
 See [run_note.md](run_note.md) for the interactive chat invocation.
+
+## Docker
+
+```bash
+docker build -t meddsagent-core .
+docker run -p 7842:7842 -v /path/to/workspace:/workspace meddsagent-core
+```
+
+The image ships **both** language runtimes, so `language: "python"` and
+`language: "r"` both work out of the box:
+
+| | Version | Packages |
+|---|---|---|
+| Node | 24 | the agent runtime |
+| Python | 3.11 | pandas, numpy, scipy, statsmodels, scikit-learn, matplotlib, seaborn, SQLAlchemy, openpyxl, pyarrow, … |
+| R | 4.6 (from CRAN's Debian repo) | jsonlite, ggplot2, dplyr, tidyr, data.table, survival + recommended |
+
+The image contains **no C/C++ compiler**: every Python and R dependency installs
+from a prebuilt binary (pip wheels; [Posit Package Manager](https://packagemanager.posit.co)
+binaries for R). Both installs are pinned binary-only, so the build fails loudly
+rather than silently pulling a ~330MB toolchain back into the runtime image.
 
 ## Docs
 
