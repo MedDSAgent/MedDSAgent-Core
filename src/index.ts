@@ -1,5 +1,5 @@
 // Package entry point.
-export const VERSION = "0.1.0";
+export const VERSION = "0.2.0";
 
 import { SessionManager } from "./session/index.js";
 import { createApp, startServer as _startServer } from "./server/index.js";
